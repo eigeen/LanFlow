@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package lanflow.v1;
+
+message Envelope {
+  oneof payload {
+    Hello hello = 1;
+    VersionReject version_reject = 2;
+    ListSharesRequest list_shares_request = 3;
+    ListSharesResponse list_shares_response = 4;
+    AuthStart auth_start = 5;
+    AuthChallenge auth_challenge = 6;
+    AuthFinish auth_finish = 7;
+    AuthResult auth_result = 8;
+    ListEntriesRequest list_entries_request = 9;
+    ListEntriesResponse list_entries_response = 10;
+    CreateSnapshotRequest create_snapshot_request = 11;
+    SnapshotManifest snapshot_manifest = 12;
+    ChunkRequest chunk_request = 13;
+    ChunkComplete chunk_complete = 14;
+    SessionAttach session_attach = 15;
+    Cancel cancel = 16;
+    Error error = 17;
+    Ping ping = 18;
+    Pong pong = 19;
+  }
+}
+
+message Hello {
+  string device_id = 1;
+  string device_name = 2;
+  uint32 min_major = 3;
+  uint32 max_major = 4;
+  uint32 max_minor = 5;
+  uint64 features = 6;
+  uint32 max_frame_size = 7;
+  uint32 max_concurrent_streams = 8;
+}
+
+message VersionReject {
+  uint32 min_major = 1;
+  uint32 max_major = 2;
+  string reason = 3;
+}
+
+message ListSharesRequest {}
+message ShareInfo { string id = 1; string name = 2; bool enabled = 3; }
+message ListSharesResponse { repeated ShareInfo shares = 1; }
+
+message AuthStart { string share_id = 1; bytes credential_request = 2; }
+message AuthChallenge { bytes credential_response = 1; bytes challenge_id = 2; }
+message AuthFinish { bytes challenge_id = 1; bytes credential_finalization = 2; }
+message AuthResult { bool success = 1; string session_id = 2; bytes server_proof = 3; string error = 4; }
+
+message ListEntriesRequest {
+  string share_id = 1;
+  string relative_path = 2;
+  uint32 offset = 3;
+  uint32 limit = 4;
+  string query = 5;
+}
+
+message Entry {
+  string id = 1;
+  bytes raw_name = 2;
+  string display_name = 3;
+  string relative_path = 4;
+  bool is_dir = 5;
+  uint64 size = 6;
+  int64 modified_ms = 7;
+}
+
+message ListEntriesResponse { repeated Entry entries = 1; bool has_more = 2; uint32 next_offset = 3; }
+
+message CreateSnapshotRequest { string share_id = 1; repeated string relative_paths = 2; uint32 chunk_size = 3; }
+message ChunkHash { uint32 index = 1; uint64 offset = 2; uint32 length = 3; bytes blake3 = 4; }
+message ManifestFile {
+  string id = 1;
+  string relative_path = 2;
+  uint64 size = 3;
+  int64 modified_ms = 4;
+  bytes blake3 = 5;
+  repeated ChunkHash chunks = 6;
+  bool is_dir = 7;
+}
+message SnapshotManifest { string snapshot_id = 1; repeated ManifestFile files = 2; string error = 3; }
+
+message ChunkRequest { string snapshot_id = 1; string file_id = 2; uint32 chunk_index = 3; }
+message ChunkComplete { string file_id = 1; uint32 chunk_index = 2; bytes blake3 = 3; uint64 bytes_sent = 4; }
+message SessionAttach { string session_id = 1; bytes nonce = 2; bytes proof = 3; }
+message Cancel { uint64 request_id = 1; string reason = 2; }
+message Error { uint32 code = 1; string message = 2; bool retryable = 3; }
+message Ping { uint64 timestamp_ms = 1; }
+message Pong { uint64 timestamp_ms = 1; }
