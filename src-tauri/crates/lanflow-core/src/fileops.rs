@@ -23,6 +23,7 @@ pub struct SnapshotFile {
 pub struct SnapshotRecord {
     pub id: String,
     pub files: Vec<SnapshotFile>,
+    file_index: HashMap<String, usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +90,19 @@ impl HashProgress {
 }
 
 impl SnapshotRecord {
+    pub fn new(id: String, files: Vec<SnapshotFile>) -> Self {
+        let file_index = files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| (file.manifest.id.clone(), index))
+            .collect();
+        Self {
+            id,
+            files,
+            file_index,
+        }
+    }
+
     pub fn wire_manifest(&self) -> SnapshotManifest {
         SnapshotManifest {
             snapshot_id: self.id.clone(),
@@ -102,7 +116,9 @@ impl SnapshotRecord {
     }
 
     pub fn find_file(&self, file_id: &str) -> Option<&SnapshotFile> {
-        self.files.iter().find(|file| file.manifest.id == file_id)
+        self.file_index
+            .get(file_id)
+            .and_then(|index| self.files.get(*index))
     }
 }
 
@@ -384,13 +400,7 @@ pub async fn create_snapshot(
                 updates.push(update);
             }
         }
-        Ok((
-            SnapshotRecord {
-                id: snapshot_id,
-                files,
-            },
-            updates,
-        ))
+        Ok((SnapshotRecord::new(snapshot_id, files), updates))
     })
     .await
     .map_err(|error| LanFlowError::Internal(error.to_string()))?

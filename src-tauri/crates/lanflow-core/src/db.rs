@@ -554,6 +554,21 @@ impl Database {
             .await?)
     }
 
+    pub async fn task_chunk_bitmaps(&self, task_id: &str) -> Result<HashMap<String, Vec<u8>>> {
+        let task_id = task_id.to_owned();
+        Ok(self
+            .connection
+            .call(move |conn| {
+                let mut statement = conn
+                    .prepare("SELECT file_id,completed_bitmap FROM task_files WHERE task_id=?1")?;
+                let rows = statement.query_map([task_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?;
+                rows.collect::<std::result::Result<HashMap<_, _>, _>>()
+            })
+            .await?)
+    }
+
     pub async fn mark_chunk_complete(
         &self,
         task_id: &str,
@@ -583,6 +598,40 @@ impl Database {
         Ok(())
     }
 
+    pub async fn mark_chunks_complete(
+        &self,
+        task_id: &str,
+        file_id: &str,
+        indexes: Vec<usize>,
+    ) -> Result<()> {
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        let task_id = task_id.to_owned();
+        let file_id = file_id.to_owned();
+        self.connection
+            .call(move |conn| {
+                let mut bitmap: Vec<u8> = conn.query_row(
+                    "SELECT completed_bitmap FROM task_files WHERE task_id=?1 AND file_id=?2",
+                    params![task_id, file_id],
+                    |row| row.get(0),
+                )?;
+                for index in indexes {
+                    if index / 8 >= bitmap.len() {
+                        bitmap.resize(index / 8 + 1, 0);
+                    }
+                    bitmap[index / 8] |= 1 << (index % 8);
+                }
+                conn.execute(
+                    "UPDATE task_files SET completed_bitmap=?3 WHERE task_id=?1 AND file_id=?2",
+                    params![task_id, file_id, bitmap],
+                )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
     pub async fn mark_file_complete(&self, task_id: &str, file_id: &str) -> Result<()> {
         let task_id = task_id.to_owned();
         let file_id = file_id.to_owned();
@@ -592,6 +641,29 @@ impl Database {
                     "UPDATE task_files SET completed=1 WHERE task_id=?1 AND file_id=?2",
                     params![task_id, file_id],
                 )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_files_complete(&self, task_id: &str, file_ids: Vec<String>) -> Result<()> {
+        if file_ids.is_empty() {
+            return Ok(());
+        }
+        let task_id = task_id.to_owned();
+        self.connection
+            .call(move |conn| {
+                let transaction = conn.transaction()?;
+                {
+                    let mut statement = transaction.prepare(
+                        "UPDATE task_files SET completed=1 WHERE task_id=?1 AND file_id=?2",
+                    )?;
+                    for file_id in file_ids {
+                        statement.execute(params![task_id, file_id])?;
+                    }
+                }
+                transaction.commit()?;
                 Ok(())
             })
             .await?;

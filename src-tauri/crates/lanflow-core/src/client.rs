@@ -156,14 +156,14 @@ impl MuxConnection {
     pub async fn download_chunk(
         &self,
         snapshot_id: &str,
-        file: &lanflow_protocol::protocol::wire::ManifestFile,
+        file_id: &str,
         chunk: &lanflow_protocol::protocol::wire::ChunkHash,
         destination: &mut tokio::fs::File,
     ) -> Result<u64> {
         let (_, mut receiver) = self
             .start_request(Payload::ChunkRequest(ChunkRequest {
                 snapshot_id: snapshot_id.to_owned(),
-                file_id: file.id.clone(),
+                file_id: file_id.to_owned(),
                 chunk_index: chunk.index,
             }))
             .await?;
@@ -189,7 +189,7 @@ impl MuxConnection {
                     let envelope = decode_envelope(&frame.body)?;
                     match envelope.payload {
                         Some(Payload::ChunkComplete(complete)) => {
-                            if complete.chunk_index != chunk.index || complete.file_id != file.id {
+                            if complete.chunk_index != chunk.index || complete.file_id != file_id {
                                 return Err(LanFlowError::Protocol("分片完成标记不匹配".into()));
                             }
                             let actual = hasher.finalize();

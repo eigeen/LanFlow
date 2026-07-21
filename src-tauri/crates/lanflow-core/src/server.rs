@@ -659,10 +659,7 @@ mod tests {
                 },
             })
             .collect();
-        let snapshot = SnapshotRecord {
-            id: "snapshot".into(),
-            files,
-        };
+        let snapshot = SnapshotRecord::new("snapshot".into(), files);
         let (sender, mut receiver) = mpsc::channel(64);
         send_snapshot_pages(
             &sender,
