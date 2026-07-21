@@ -7,6 +7,8 @@ use crate::protocol::{MAX_FRAME_SIZE, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 pub const MAGIC: [u8; 4] = *b"LNF!";
 pub const BASE_HEADER_LEN: usize = 32;
 pub const V1_HEADER_LEN: usize = 48;
+/// More frames with the same request ID follow this frame.
+pub const FLAG_MORE: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameType {
@@ -193,7 +195,7 @@ mod tests {
         write_frame(&mut output, &frame).await.unwrap();
         let golden: &[u8] = &[
             0x4c, 0x4e, 0x46, 0x21, // magic
-            0x00, 0x01, 0x00, 0x00, // major, minor
+            0x00, 0x01, 0x00, 0x01, // major, minor
             0x00, 0x30, 0x00, 0x04, // header length, data frame
             0x00, 0x00, 0x00, 0x00, // flags
             0x00, 0x00, 0x00, 0x05, // body length

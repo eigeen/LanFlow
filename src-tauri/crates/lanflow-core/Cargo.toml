@@ -23,6 +23,7 @@ opaque-ke = { version = "4.0", features = ["argon2", "ristretto255"] }
 opaque-rand = { package = "rand", version = "0.8", features = ["getrandom"] }
 prost = "0.14"
 rand = "0.9"
+rayon = "1.12"
 sha2 = "0.10"
 socket2 = { version = "0.6", features = ["all"] }
 thiserror = "2"

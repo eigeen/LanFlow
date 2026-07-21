@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use prost::Message;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -14,11 +15,11 @@ use crate::auth::{LanFlowServerSetup, ServerPendingLogin, begin_server_login, ma
 use crate::db::Database;
 use crate::error::{LanFlowError, Result};
 use crate::fileops::{SnapshotRecord, create_snapshot, list_entries};
-use lanflow_protocol::frame::{Frame, FrameHeader, FrameType, read_frame, write_frame};
+use lanflow_protocol::frame::{FLAG_MORE, Frame, FrameHeader, FrameType, read_frame, write_frame};
 use lanflow_protocol::protocol::wire::envelope::Payload;
 use lanflow_protocol::protocol::wire::{
     AuthChallenge, AuthResult, ChunkComplete, Error as WireError, Hello, ListEntriesResponse,
-    ListSharesResponse, Pong, ShareInfo,
+    ListSharesResponse, Pong, ShareInfo, SnapshotManifestPage, SnapshotProgress,
 };
 use lanflow_protocol::protocol::{
     DEFAULT_CHUNK_SIZE, DEFAULT_DATA_FRAME_SIZE, MAX_FRAME_SIZE, PROTOCOL_MAJOR, PROTOCOL_MINOR,
@@ -124,6 +125,7 @@ async fn handle_connection(context: Arc<ServerContext>, stream: TcpStream) -> Re
         send_envelope(&sender, first.header, FrameType::VersionReject, payload).await?;
         return Err(LanFlowError::Protocol("协议主版本不兼容".into()));
     }
+    let supports_snapshot_pages = client_hello.max_minor >= 1;
     send_envelope(
         &sender,
         first.header,
@@ -342,7 +344,10 @@ async fn handle_connection(context: Arc<ServerContext>, stream: TcpStream) -> Re
                     send_error(&sender, &frame.header, 3001, "分享不存在", false).await?;
                     continue;
                 };
-                let snapshot = create_snapshot(
+                let cache = context.db.load_hash_cache().await?;
+                let (progress_sender, mut progress_receiver) =
+                    tokio::sync::mpsc::unbounded_channel();
+                let build = create_snapshot(
                     share.path.into(),
                     request.relative_paths,
                     if request.chunk_size == 0 {
@@ -350,21 +355,53 @@ async fn handle_connection(context: Arc<ServerContext>, stream: TcpStream) -> Re
                     } else {
                         request.chunk_size
                     },
-                )
-                .await?;
-                let manifest = snapshot.wire_manifest();
+                    cache,
+                    progress_sender,
+                );
+                tokio::pin!(build);
+                let (snapshot, cache_updates) = loop {
+                    tokio::select! {
+                        Some(progress) = progress_receiver.recv() => {
+                            if supports_snapshot_pages {
+                                send_envelope_with_flags(
+                                    &sender,
+                                    frame.header.clone(),
+                                    FrameType::Control,
+                                    FLAG_MORE,
+                                    Payload::SnapshotProgress(SnapshotProgress {
+                                        snapshot_id: progress.snapshot_id,
+                                        phase: progress.phase.into(),
+                                        scanned_entries: progress.scanned_entries,
+                                        total_entries: progress.total_entries,
+                                        prepared_bytes: progress.prepared_bytes,
+                                        total_bytes: progress.total_bytes,
+                                        cache_hits: progress.cache_hits,
+                                        current_path: progress.current_path,
+                                    }),
+                                ).await?;
+                            }
+                        }
+                        result = &mut build => break result?,
+                    }
+                };
+                context.db.store_hash_cache(cache_updates).await?;
+                let snapshot = Arc::new(snapshot);
                 context
                     .snapshots
                     .write()
                     .await
-                    .insert(snapshot.id.clone(), Arc::new(snapshot));
-                send_envelope(
-                    &sender,
-                    frame.header,
-                    FrameType::Control,
-                    Payload::SnapshotManifest(manifest),
-                )
-                .await?;
+                    .insert(snapshot.id.clone(), snapshot.clone());
+                if supports_snapshot_pages {
+                    send_snapshot_pages(&sender, frame.header, &snapshot).await?;
+                } else {
+                    send_envelope(
+                        &sender,
+                        frame.header,
+                        FrameType::Control,
+                        Payload::SnapshotManifest(snapshot.wire_manifest()),
+                    )
+                    .await?;
+                }
             }
             Payload::ChunkRequest(request) => {
                 let _session = active_session
@@ -501,17 +538,79 @@ async fn send_envelope(
     frame_type: FrameType,
     payload: Payload,
 ) -> Result<()> {
+    send_envelope_with_flags(sender, request_header, frame_type, 0, payload).await
+}
+
+async fn send_envelope_with_flags(
+    sender: &mpsc::Sender<Frame>,
+    request_header: FrameHeader,
+    frame_type: FrameType,
+    flags: u32,
+    payload: Payload,
+) -> Result<()> {
+    let mut header = FrameHeader::new(
+        frame_type,
+        request_header.stream_id,
+        request_header.request_id,
+    );
+    header.flags = flags;
     sender
         .send(Frame {
-            header: FrameHeader::new(
-                frame_type,
-                request_header.stream_id,
-                request_header.request_id,
-            ),
+            header,
             body: encode_envelope(&envelope(payload))?,
         })
         .await
         .map_err(|_| LanFlowError::Cancelled)
+}
+
+async fn send_snapshot_pages(
+    sender: &mpsc::Sender<Frame>,
+    request_header: FrameHeader,
+    snapshot: &SnapshotRecord,
+) -> Result<()> {
+    const PAGE_TARGET: usize = 512 * 1024;
+    let mut page = Vec::new();
+    let mut page_size = snapshot.id.len() + 32;
+    for snapshot_file in &snapshot.files {
+        let file_size = snapshot_file.manifest.encoded_len() + 8;
+        if !page.is_empty() && page_size + file_size > PAGE_TARGET {
+            send_envelope_with_flags(
+                sender,
+                request_header.clone(),
+                FrameType::Control,
+                FLAG_MORE,
+                Payload::SnapshotManifestPage(SnapshotManifestPage {
+                    snapshot_id: snapshot.id.clone(),
+                    files: std::mem::take(&mut page),
+                    done: false,
+                    error: String::new(),
+                }),
+            )
+            .await?;
+            page_size = snapshot.id.len() + 32;
+        }
+        if file_size > MAX_FRAME_SIZE / 2 {
+            return Err(LanFlowError::Protocol(format!(
+                "单文件分片清单过大: {}",
+                snapshot_file.manifest.relative_path
+            )));
+        }
+        page_size += file_size;
+        page.push(snapshot_file.manifest.clone());
+    }
+    send_envelope_with_flags(
+        sender,
+        request_header,
+        FrameType::Control,
+        0,
+        Payload::SnapshotManifestPage(SnapshotManifestPage {
+            snapshot_id: snapshot.id.clone(),
+            files: page,
+            done: true,
+            error: String::new(),
+        }),
+    )
+    .await
 }
 
 async fn send_error(
@@ -532,4 +631,64 @@ async fn send_error(
         }),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fileops::SnapshotFile;
+    use lanflow_protocol::protocol::wire::ManifestFile;
+
+    #[tokio::test]
+    async fn large_manifest_is_split_into_bounded_pages() {
+        let files = (0..8_000)
+            .map(|index| SnapshotFile {
+                absolute_path: format!("/tmp/file-{index}").into(),
+                manifest: ManifestFile {
+                    id: format!("{index:064x}"),
+                    relative_path: format!("folder/file-{index:05}.txt"),
+                    size: 12,
+                    modified_ms: 1,
+                    blake3: Bytes::from(vec![1; 32]),
+                    chunks: Vec::new(),
+                    is_dir: false,
+                },
+            })
+            .collect();
+        let snapshot = SnapshotRecord {
+            id: "snapshot".into(),
+            files,
+        };
+        let (sender, mut receiver) = mpsc::channel(64);
+        send_snapshot_pages(
+            &sender,
+            FrameHeader::new(FrameType::Control, 3, 9),
+            &snapshot,
+        )
+        .await
+        .unwrap();
+        drop(sender);
+
+        let mut frames = Vec::new();
+        while let Some(frame) = receiver.recv().await {
+            assert!(frame.body.len() <= MAX_FRAME_SIZE);
+            frames.push(frame);
+        }
+        assert!(frames.len() > 1);
+        assert!(
+            frames[..frames.len() - 1]
+                .iter()
+                .all(|frame| frame.header.flags & FLAG_MORE != 0)
+        );
+        assert_eq!(frames.last().unwrap().header.flags & FLAG_MORE, 0);
+        let count = frames
+            .into_iter()
+            .map(|frame| decode_envelope(&frame.body).unwrap())
+            .map(|message| match message.payload.unwrap() {
+                Payload::SnapshotManifestPage(page) => page.files.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        assert_eq!(count, 8_000);
+    }
 }

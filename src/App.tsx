@@ -72,6 +72,16 @@ type ProgressEvent = {
   fileCount: number;
   currentFile: string;
 };
+type SnapshotProgress = {
+  taskId: string;
+  phase: "scanning" | "hashing";
+  scannedEntries: number;
+  totalEntries: number;
+  preparedBytes: number;
+  totalBytes: number;
+  cacheHits: number;
+  currentPath: string;
+};
 
 const statusText: Record<string, string> = {
   preparing: "正在准备",
@@ -115,6 +125,7 @@ function App() {
   const [conflictPolicy, setConflictPolicy] = useState("keep_both");
   const [shareForm, setShareForm] = useState({ name: "", path: "", password: "" });
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [snapshotProgress, setSnapshotProgress] = useState<SnapshotProgress | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -129,7 +140,7 @@ function App() {
   useEffect(() => {
     void refresh();
     const interval = window.setInterval(refresh, 5000);
-    const unlisten = listen<ProgressEvent>("task://progress", ({ payload }) => {
+    const unlistenTask = listen<ProgressEvent>("task://progress", ({ payload }) => {
       setOverview((current) =>
         current
           ? {
@@ -152,9 +163,13 @@ function App() {
           : current,
       );
     });
+    const unlistenSnapshot = listen<SnapshotProgress>("snapshot://progress", ({ payload }) => {
+      setSnapshotProgress(payload);
+    });
     return () => {
       window.clearInterval(interval);
-      void unlisten.then((dispose) => dispose());
+      void unlistenTask.then((dispose) => dispose());
+      void unlistenSnapshot.then((dispose) => dispose());
     };
   }, [refresh]);
 
@@ -223,6 +238,7 @@ function App() {
 
   const createTask = async () => {
     if (!connectedPeer || !remoteShare || selectedPaths.size === 0 || !destination) return;
+    setSnapshotProgress(null);
     await run("task", async () => {
       await invoke("create_download_task", {
         input: {
@@ -237,6 +253,7 @@ function App() {
       setTab("tasks");
       setSelectedPaths(new Set());
     });
+    setSnapshotProgress(null);
   };
 
   const selectDirectory = async (target: "destination" | "share") => {
@@ -373,7 +390,13 @@ function App() {
                       <div className="download-dock">
                         <button className="path-picker" onClick={() => void selectDirectory("destination")}><span>保存到</span><strong>{destination || "选择本地目录…"}</strong></button>
                         <select value={conflictPolicy} onChange={(event) => setConflictPolicy(event.target.value)}><option value="keep_both">冲突时保留两份</option><option value="overwrite">冲突时覆盖</option><option value="skip">冲突时跳过</option></select>
-                        <button className="primary" disabled={!destination || selectedPaths.size === 0 || !!busy} onClick={() => void createTask()}>{busy === "task" ? "准备快照…" : `开始同步 ${selectedPaths.size} 项`}</button>
+                        {busy === "task" && snapshotProgress && (
+                          <div className="snapshot-progress">
+                            <strong>{snapshotProgress.phase === "scanning" ? `已扫描 ${snapshotProgress.scannedEntries} 项` : `准备 ${snapshotProgress.totalBytes > 0 ? Math.min(100, Math.round(snapshotProgress.preparedBytes / snapshotProgress.totalBytes * 100)) : 0}%`}</strong>
+                            <span>{snapshotProgress.phase === "hashing" ? `${formatBytes(snapshotProgress.preparedBytes)} / ${formatBytes(snapshotProgress.totalBytes)} · 缓存命中 ${snapshotProgress.cacheHits}` : snapshotProgress.currentPath}</span>
+                          </div>
+                        )}
+                        <button className="primary" disabled={!destination || selectedPaths.size === 0 || !!busy} onClick={() => void createTask()}>{busy === "task" ? snapshotProgress?.phase === "scanning" ? `扫描 ${snapshotProgress.scannedEntries} 项…` : snapshotProgress ? `准备 ${snapshotProgress.totalBytes > 0 ? Math.min(100, Math.round(snapshotProgress.preparedBytes / snapshotProgress.totalBytes * 100)) : 0}%…` : "准备快照…" : `开始同步 ${selectedPaths.size} 项`}</button>
                       </div>
                     </div>
                   )}

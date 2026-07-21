@@ -2,7 +2,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use base64::Engine;
-use tauri::State;
+use serde::Serialize;
+use tauri::{Emitter, State};
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::core::AppCore;
@@ -14,6 +15,20 @@ use lanflow_core::models::{
     AppOverview, ConflictPolicy, CreateTaskInput, PeerDto, PerformanceSettings, RemoteEntryDto,
     RemoteShareDto, ShareDto, TaskDto,
 };
+use lanflow_core::tasks::TaskProgressEvent;
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotProgressEvent {
+    task_id: String,
+    phase: String,
+    scanned_entries: u64,
+    total_entries: u64,
+    prepared_bytes: u64,
+    total_bytes: u64,
+    cache_hits: u64,
+    current_path: String,
+}
 
 #[tauri::command]
 pub async fn get_overview(core: State<'_, Arc<AppCore>>) -> Result<AppOverview> {
@@ -237,40 +252,87 @@ pub async fn create_download_task(
     let client = core.client(&input.peer_id).await?;
     let settings = core.db.settings().await?;
     let chunk_size = settings.chunk_size_mib.clamp(1, 64) * 1024 * 1024;
-    let manifest = client
-        .create_snapshot(
-            input.share_id.clone(),
-            input.remote_paths.clone(),
-            chunk_size,
-        )
-        .await?;
     let now = now_ms();
-    let task = TaskDto {
+    let mut task = TaskDto {
         id: uuid::Uuid::new_v4().to_string(),
         peer_id: input.peer_id.clone(),
         peer_name: client.peer.name.clone(),
         share_id: input.share_id.clone(),
         destination: destination.to_string_lossy().into_owned(),
         status: "preparing".into(),
-        total_bytes: manifest.files.iter().map(|file| file.size).sum(),
+        total_bytes: 0,
         completed_bytes: 0,
         speed_bps: 0,
-        file_count: manifest.files.iter().filter(|file| !file.is_dir).count() as u64,
+        file_count: 0,
         completed_files: 0,
         error: None,
         created_at: now,
         updated_at: now,
     };
-    let snapshot =
-        base64::engine::general_purpose::STANDARD.encode(prost::Message::encode_to_vec(&manifest));
+    let remote_paths = serde_json::to_string(&input.remote_paths)
+        .map_err(|error| LanFlowError::Internal(error.to_string()))?;
     core.db
         .insert_task(
             &task,
-            serde_json::to_string(&input.remote_paths)
-                .map_err(|error| LanFlowError::Internal(error.to_string()))?,
+            remote_paths,
             input.conflict_policy.as_str().into(),
-            Some(snapshot),
+            None,
         )
+        .await?;
+
+    let app = core.app.clone();
+    let task_id = task.id.clone();
+    let manifest_result = client
+        .create_snapshot(
+            input.share_id.clone(),
+            input.remote_paths.clone(),
+            chunk_size,
+            move |progress| {
+                let _ = app.emit(
+                    "task://progress",
+                    TaskProgressEvent {
+                        task_id: task_id.clone(),
+                        status: "preparing".into(),
+                        completed_bytes: progress.prepared_bytes,
+                        total_bytes: progress.total_bytes,
+                        speed_bps: 0,
+                        completed_files: 0,
+                        file_count: progress.total_entries,
+                        current_file: progress.current_path.clone(),
+                    },
+                );
+                let _ = app.emit(
+                    "snapshot://progress",
+                    SnapshotProgressEvent {
+                        task_id: task_id.clone(),
+                        phase: progress.phase,
+                        scanned_entries: progress.scanned_entries,
+                        total_entries: progress.total_entries,
+                        prepared_bytes: progress.prepared_bytes,
+                        total_bytes: progress.total_bytes,
+                        cache_hits: progress.cache_hits,
+                        current_path: progress.current_path,
+                    },
+                );
+            },
+        )
+        .await;
+    let manifest = match manifest_result {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            core.db
+                .set_task_status(&task.id, "failed", Some(error.to_string()))
+                .await?;
+            return Err(error);
+        }
+    };
+    task.total_bytes = manifest.files.iter().map(|file| file.size).sum();
+    task.file_count = manifest.files.iter().filter(|file| !file.is_dir).count() as u64;
+    task.updated_at = now_ms();
+    let snapshot =
+        base64::engine::general_purpose::STANDARD.encode(prost::Message::encode_to_vec(&manifest));
+    core.db
+        .update_task_manifest(&task.id, snapshot, task.total_bytes, task.file_count)
         .await?;
     core.task_engine
         .start(
@@ -329,9 +391,52 @@ pub async fn resume_task(core: State<'_, Arc<AppCore>>, task_id: String) -> Resu
     };
     let client = core.client(&peer_id).await?;
     let settings = core.db.settings().await?;
-    let manifest = client
-        .create_snapshot(share_id, paths, settings.chunk_size_mib * 1024 * 1024)
-        .await?;
+    let app = core.app.clone();
+    let progress_task_id = task_id.clone();
+    let manifest_result = client
+        .create_snapshot(
+            share_id,
+            paths,
+            settings.chunk_size_mib * 1024 * 1024,
+            move |progress| {
+                let _ = app.emit(
+                    "task://progress",
+                    TaskProgressEvent {
+                        task_id: progress_task_id.clone(),
+                        status: "preparing".into(),
+                        completed_bytes: progress.prepared_bytes,
+                        total_bytes: progress.total_bytes,
+                        speed_bps: 0,
+                        completed_files: 0,
+                        file_count: progress.total_entries,
+                        current_file: progress.current_path.clone(),
+                    },
+                );
+                let _ = app.emit(
+                    "snapshot://progress",
+                    SnapshotProgressEvent {
+                        task_id: progress_task_id.clone(),
+                        phase: progress.phase,
+                        scanned_entries: progress.scanned_entries,
+                        total_entries: progress.total_entries,
+                        prepared_bytes: progress.prepared_bytes,
+                        total_bytes: progress.total_bytes,
+                        cache_hits: progress.cache_hits,
+                        current_path: progress.current_path,
+                    },
+                );
+            },
+        )
+        .await;
+    let manifest = match manifest_result {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            core.db
+                .set_task_status(&task_id, "failed", Some(error.to_string()))
+                .await?;
+            return Err(error);
+        }
+    };
     let task = core
         .db
         .list_tasks()

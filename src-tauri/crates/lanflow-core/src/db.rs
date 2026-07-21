@@ -1,10 +1,30 @@
+use std::collections::HashMap;
 use std::path::Path;
 
+use base64::Engine;
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use tokio_rusqlite::{Connection, params};
 
 use crate::error::{LanFlowError, Result};
 use crate::models::{PerformanceSettings, ShareDto, TaskDto};
-use lanflow_protocol::protocol::wire::ManifestFile;
+use lanflow_protocol::protocol::wire::{ChunkHash, ManifestFile};
+
+#[derive(Clone, Debug)]
+pub struct HashCacheEntry {
+    pub size: u64,
+    pub modified_ms: i64,
+    pub full_hash: Bytes,
+    pub chunks: Vec<ChunkHash>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredChunk {
+    index: u32,
+    offset: u64,
+    length: u32,
+    hash: String,
+}
 
 #[derive(Clone)]
 pub struct Database {
@@ -117,6 +137,103 @@ impl Database {
                      ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     params![key, value],
                 )?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn load_hash_cache(&self) -> Result<HashMap<String, HashCacheEntry>> {
+        Ok(self
+            .connection
+            .call(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT cache_key,size,modified_ms,full_hash,chunks_json FROM hash_cache",
+                )?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?;
+                let mut cache = HashMap::new();
+                for row in rows {
+                    let (key, size, modified_ms, full_hash, chunks_json) = row?;
+                    let stored: Vec<StoredChunk> =
+                        serde_json::from_str(&chunks_json).map_err(|error| {
+                            tokio_rusqlite::rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                        })?;
+                    let mut chunks = Vec::with_capacity(stored.len());
+                    for chunk in stored {
+                        let hash = base64::engine::general_purpose::STANDARD
+                            .decode(chunk.hash)
+                            .map_err(|error| {
+                                tokio_rusqlite::rusqlite::Error::ToSqlConversionFailure(Box::new(
+                                    error,
+                                ))
+                            })?;
+                        chunks.push(ChunkHash {
+                            index: chunk.index,
+                            offset: chunk.offset,
+                            length: chunk.length,
+                            blake3: Bytes::from(hash),
+                        });
+                    }
+                    cache.insert(
+                        key,
+                        HashCacheEntry {
+                            size,
+                            modified_ms,
+                            full_hash: Bytes::from(full_hash),
+                            chunks,
+                        },
+                    );
+                }
+                Ok(cache)
+            })
+            .await?)
+    }
+
+    pub async fn store_hash_cache(&self, entries: Vec<(String, HashCacheEntry)>) -> Result<()> {
+        self.connection
+            .call(move |conn| {
+                let transaction = conn.transaction()?;
+                for (key, entry) in entries {
+                    let chunks = entry
+                        .chunks
+                        .iter()
+                        .map(|chunk| StoredChunk {
+                            index: chunk.index,
+                            offset: chunk.offset,
+                            length: chunk.length,
+                            hash: base64::engine::general_purpose::STANDARD
+                                .encode(&chunk.blake3),
+                        })
+                        .collect::<Vec<_>>();
+                    let chunks_json = serde_json::to_string(&chunks).map_err(|error| {
+                        tokio_rusqlite::rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?;
+                    transaction.execute(
+                        "INSERT INTO hash_cache(cache_key,size,modified_ms,full_hash,chunks_json,updated_at)
+                         VALUES(?1,?2,?3,?4,?5,?6)
+                         ON CONFLICT(cache_key) DO UPDATE SET
+                           size=excluded.size,modified_ms=excluded.modified_ms,
+                           full_hash=excluded.full_hash,chunks_json=excluded.chunks_json,
+                           updated_at=excluded.updated_at",
+                        params![
+                            key,
+                            entry.size as i64,
+                            entry.modified_ms,
+                            entry.full_hash.to_vec(),
+                            chunks_json,
+                            crate::discovery::now_ms()
+                        ],
+                    )?;
+                }
+                transaction.commit()?;
                 Ok(())
             })
             .await?;

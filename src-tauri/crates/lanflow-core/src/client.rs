@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use rand::Rng;
@@ -11,11 +12,11 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use crate::auth::{begin_client_login, mac, verify_mac};
 use crate::error::{LanFlowError, Result};
 use crate::models::{PeerDto, RemoteEntryDto, RemoteShareDto};
-use lanflow_protocol::frame::{Frame, FrameHeader, FrameType, read_frame, write_frame};
+use lanflow_protocol::frame::{FLAG_MORE, Frame, FrameHeader, FrameType, read_frame, write_frame};
 use lanflow_protocol::protocol::wire::envelope::Payload;
 use lanflow_protocol::protocol::wire::{
     AuthFinish, AuthStart, ChunkRequest, CreateSnapshotRequest, Hello, ListEntriesRequest,
-    ListSharesRequest, SessionAttach, SnapshotManifest,
+    ListSharesRequest, SessionAttach, SnapshotManifest, SnapshotProgress,
 };
 use lanflow_protocol::protocol::{
     MAX_FRAME_SIZE, PROTOCOL_MAJOR, PROTOCOL_MINOR, decode_envelope, encode_envelope, envelope,
@@ -78,7 +79,8 @@ impl MuxConnection {
                     .get(&frame.header.request_id)
                     .cloned();
                 if let Some(sender) = sender {
-                    let final_frame = frame.header.frame_type != FrameType::Data;
+                    let final_frame = frame.header.frame_type != FrameType::Data
+                        && frame.header.flags & FLAG_MORE == 0;
                     let request_id = frame.header.request_id;
                     let _ = sender.send(frame).await;
                     if final_frame {
@@ -97,7 +99,7 @@ impl MuxConnection {
         }))
     }
 
-    pub async fn start_request(&self, payload: Payload) -> Result<mpsc::Receiver<Frame>> {
+    pub async fn start_request(&self, payload: Payload) -> Result<(u64, mpsc::Receiver<Frame>)> {
         let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let stream_id = self.next_stream.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(16);
@@ -110,15 +112,21 @@ impl MuxConnection {
             self.pending.lock().await.remove(&request_id);
             return Err(error.into());
         }
-        Ok(receiver)
+        Ok((request_id, receiver))
     }
 
     pub async fn unary(&self, payload: Payload) -> Result<Payload> {
-        let mut receiver = self.start_request(payload).await?;
-        let frame = receiver
-            .recv()
-            .await
-            .ok_or_else(|| LanFlowError::Protocol("连接在响应前关闭".into()))?;
+        let (request_id, mut receiver) = self.start_request(payload).await?;
+        let received = tokio::time::timeout(Duration::from_secs(30), receiver.recv()).await;
+        let frame = match received {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return Err(LanFlowError::Protocol("连接在响应前关闭".into())),
+            Err(_) => {
+                self.pending.lock().await.remove(&request_id);
+                return Err(LanFlowError::Protocol("请求响应超时".into()));
+            }
+        };
+        self.pending.lock().await.remove(&request_id);
         let envelope = decode_envelope(&frame.body)?;
         match envelope.payload {
             Some(Payload::Error(error)) => Err(LanFlowError::Protocol(error.message)),
@@ -152,7 +160,7 @@ impl MuxConnection {
         chunk: &lanflow_protocol::protocol::wire::ChunkHash,
         destination: &mut tokio::fs::File,
     ) -> Result<u64> {
-        let mut receiver = self
+        let (_, mut receiver) = self
             .start_request(Payload::ChunkRequest(ChunkRequest {
                 snapshot_id: snapshot_id.to_owned(),
                 file_id: file.id.clone(),
@@ -351,19 +359,66 @@ impl PeerClient {
         share_id: String,
         paths: Vec<String>,
         chunk_size: u32,
+        on_progress: impl Fn(SnapshotProgress),
     ) -> Result<SnapshotManifest> {
-        match self
+        let (request_id, mut receiver) = self
             .control
-            .unary(Payload::CreateSnapshotRequest(CreateSnapshotRequest {
+            .start_request(Payload::CreateSnapshotRequest(CreateSnapshotRequest {
                 share_id,
                 relative_paths: paths,
                 chunk_size,
             }))
-            .await?
-        {
-            Payload::SnapshotManifest(manifest) if manifest.error.is_empty() => Ok(manifest),
-            Payload::SnapshotManifest(manifest) => Err(LanFlowError::Protocol(manifest.error)),
-            _ => Err(LanFlowError::Protocol("快照响应无效".into())),
+            .await?;
+        let mut snapshot_id = String::new();
+        let mut files = Vec::new();
+        let progress_timeout = if self.control.remote_hello.max_minor >= 1 {
+            Duration::from_secs(5 * 60)
+        } else {
+            Duration::from_secs(30 * 60)
+        };
+        loop {
+            let received = tokio::time::timeout(progress_timeout, receiver.recv()).await;
+            let frame = match received {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return Err(LanFlowError::Protocol("快照完成前连接关闭".into())),
+                Err(_) => {
+                    self.control.pending.lock().await.remove(&request_id);
+                    return Err(LanFlowError::Protocol("快照准备长时间没有进度".into()));
+                }
+            };
+            let message = decode_envelope(&frame.body)?;
+            match message.payload {
+                Some(Payload::SnapshotProgress(progress)) => on_progress(progress),
+                Some(Payload::SnapshotManifestPage(page)) => {
+                    if !page.error.is_empty() {
+                        self.control.pending.lock().await.remove(&request_id);
+                        return Err(LanFlowError::Protocol(page.error));
+                    }
+                    if snapshot_id.is_empty() {
+                        snapshot_id = page.snapshot_id.clone();
+                    } else if snapshot_id != page.snapshot_id {
+                        self.control.pending.lock().await.remove(&request_id);
+                        return Err(LanFlowError::Protocol("快照分页 ID 不一致".into()));
+                    }
+                    files.extend(page.files);
+                    if page.done {
+                        self.control.pending.lock().await.remove(&request_id);
+                        return Ok(SnapshotManifest {
+                            snapshot_id,
+                            files,
+                            error: String::new(),
+                        });
+                    }
+                }
+                Some(Payload::SnapshotManifest(manifest)) if manifest.error.is_empty() => {
+                    return Ok(manifest);
+                }
+                Some(Payload::SnapshotManifest(manifest)) => {
+                    return Err(LanFlowError::Protocol(manifest.error));
+                }
+                Some(Payload::Error(error)) => return Err(LanFlowError::Protocol(error.message)),
+                _ => return Err(LanFlowError::Protocol("快照响应无效".into())),
+            }
         }
     }
 

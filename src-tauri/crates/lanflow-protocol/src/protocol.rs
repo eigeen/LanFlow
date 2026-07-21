@@ -7,7 +7,7 @@ pub mod wire {
 }
 
 pub const PROTOCOL_MAJOR: u16 = 1;
-pub const PROTOCOL_MINOR: u16 = 0;
+pub const PROTOCOL_MINOR: u16 = 1;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const DEFAULT_DATA_FRAME_SIZE: usize = 256 * 1024;
 pub const DEFAULT_CHUNK_SIZE: u32 = 8 * 1024 * 1024;
