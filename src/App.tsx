@@ -48,6 +48,7 @@ type Settings = {
   dataConnections: number;
   streamsPerConnection: number;
   chunkSizeMib: number;
+  hashWorkers: number;
   bandwidthLimitMbps: number;
   listenPort: number;
   autostart: boolean;
@@ -81,6 +82,8 @@ type SnapshotProgress = {
   totalBytes: number;
   cacheHits: number;
   currentPath: string;
+  hashWorkers: number;
+  speedBps: number;
 };
 
 const statusText: Record<string, string> = {
@@ -393,7 +396,7 @@ function App() {
                         {busy === "task" && snapshotProgress && (
                           <div className="snapshot-progress">
                             <strong>{snapshotProgress.phase === "scanning" ? `已扫描 ${snapshotProgress.scannedEntries} 项` : `准备 ${snapshotProgress.totalBytes > 0 ? Math.min(100, Math.round(snapshotProgress.preparedBytes / snapshotProgress.totalBytes * 100)) : 0}%`}</strong>
-                            <span>{snapshotProgress.phase === "hashing" ? `${formatBytes(snapshotProgress.preparedBytes)} / ${formatBytes(snapshotProgress.totalBytes)} · 缓存命中 ${snapshotProgress.cacheHits}` : snapshotProgress.currentPath}</span>
+                            <span>{snapshotProgress.phase === "hashing" ? `${formatBytes(snapshotProgress.preparedBytes)} / ${formatBytes(snapshotProgress.totalBytes)} · ${formatBytes(snapshotProgress.speedBps)}/s · ${snapshotProgress.hashWorkers} 线程 · 缓存命中 ${snapshotProgress.cacheHits}` : snapshotProgress.currentPath}</span>
                           </div>
                         )}
                         <button className="primary" disabled={!destination || selectedPaths.size === 0 || !!busy} onClick={() => void createTask()}>{busy === "task" ? snapshotProgress?.phase === "scanning" ? `扫描 ${snapshotProgress.scannedEntries} 项…` : snapshotProgress ? `准备 ${snapshotProgress.totalBytes > 0 ? Math.min(100, Math.round(snapshotProgress.preparedBytes / snapshotProgress.totalBytes * 100)) : 0}%…` : "准备快照…" : `开始同步 ${selectedPaths.size} 项`}</button>
@@ -452,7 +455,7 @@ function App() {
 
           {tab === "settings" && (
             <form className="settings-grid" onSubmit={(event) => { event.preventDefault(); void run("settings", async () => { await invoke("save_settings", { settings }); await refresh(); }); }}>
-              <section className="panel settings-section"><span className="eyebrow">传输性能</span><h2>连接与并发</h2><label className="setting-toggle"><div><strong>自动调节</strong><span>根据吞吐和失败率使用安全默认值</span></div><label className="switch"><input type="checkbox" checked={settings.automatic} onChange={(event) => setSettings({ ...settings, automatic: event.target.checked })} /><span /></label></label><div className="form-grid"><label>数据连接数<input type="number" min="1" max="8" value={settings.dataConnections} onChange={(event) => setSettings({ ...settings, dataConnections: Number(event.target.value) })} /></label><label>每连接并发<input type="number" min="1" max="16" value={settings.streamsPerConnection} onChange={(event) => setSettings({ ...settings, streamsPerConnection: Number(event.target.value) })} /></label><label>分片大小（MiB）<input type="number" min="1" max="64" value={settings.chunkSizeMib} onChange={(event) => setSettings({ ...settings, chunkSizeMib: Number(event.target.value) })} /></label><label>限速（Mbps，0 为不限）<input type="number" min="0" value={settings.bandwidthLimitMbps} onChange={(event) => setSettings({ ...settings, bandwidthLimitMbps: Number(event.target.value) })} /></label></div></section>
+              <section className="panel settings-section"><span className="eyebrow">传输性能</span><h2>连接与并发</h2><label className="setting-toggle"><div><strong>自动调节</strong><span>根据吞吐和失败率使用安全默认值</span></div><label className="switch"><input type="checkbox" checked={settings.automatic} onChange={(event) => setSettings({ ...settings, automatic: event.target.checked })} /><span /></label></label><div className="form-grid"><label>数据连接数<input type="number" min="1" max="8" value={settings.dataConnections} onChange={(event) => setSettings({ ...settings, dataConnections: Number(event.target.value) })} /></label><label>每连接并发<input type="number" min="1" max="16" value={settings.streamsPerConnection} onChange={(event) => setSettings({ ...settings, streamsPerConnection: Number(event.target.value) })} /></label><label>分片大小（MiB）<input type="number" min="1" max="64" value={settings.chunkSizeMib} onChange={(event) => setSettings({ ...settings, chunkSizeMib: Number(event.target.value) })} /></label><label>快照哈希线程（0 为自动）<input type="number" min="0" max="32" value={settings.hashWorkers} onChange={(event) => setSettings({ ...settings, hashWorkers: Number(event.target.value) })} /></label><label>限速（Mbps，0 为不限）<input type="number" min="0" value={settings.bandwidthLimitMbps} onChange={(event) => setSettings({ ...settings, bandwidthLimitMbps: Number(event.target.value) })} /></label></div></section>
               <section className="panel settings-section"><span className="eyebrow">应用行为</span><h2>服务与启动</h2><label>监听端口<input type="number" min="1024" max="65535" value={settings.listenPort} onChange={(event) => setSettings({ ...settings, listenPort: Number(event.target.value) })} /><small>端口修改将在下次启动后生效</small></label><label className="setting-toggle"><div><strong>登录时启动</strong><span>在后台启动分享与未完成任务</span></div><label className="switch"><input type="checkbox" checked={settings.autostart} onChange={(event) => setSettings({ ...settings, autostart: event.target.checked })} /><span /></label></label><div className="notice"><strong>明文传输</strong><p>LanFlow 当前不加密文件名和内容，请只在可信局域网中使用。密码认证和数据校验仍受保护。</p></div></section>
               <div className="settings-footer"><button className="primary" disabled={!!busy}>{busy === "settings" ? "正在保存…" : "保存设置"}</button></div>
             </form>

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,21 +35,31 @@ pub struct SnapshotBuildProgress {
     pub total_bytes: u64,
     pub cache_hits: u64,
     pub current_path: String,
+    pub hash_workers: u32,
+    pub speed_bps: u64,
 }
 
 struct HashProgress {
     snapshot_id: String,
     sender: UnboundedSender<SnapshotBuildProgress>,
     prepared_bytes: AtomicU64,
+    hashed_bytes: AtomicU64,
     cache_hits: AtomicU64,
     total_entries: u64,
     total_bytes: u64,
+    hash_workers: u32,
+    started: Instant,
     last_emit: Mutex<Instant>,
 }
 
 impl HashProgress {
     fn add(&self, bytes: u64, cache_hit: bool, current_path: &str, force: bool) {
         let prepared_bytes = self.prepared_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let hashed_bytes = if cache_hit {
+            self.hashed_bytes.load(Ordering::Relaxed)
+        } else {
+            self.hashed_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes
+        };
         let cache_hits = if cache_hit {
             self.cache_hits.fetch_add(1, Ordering::Relaxed) + 1
         } else {
@@ -70,6 +80,9 @@ impl HashProgress {
                 total_bytes: self.total_bytes,
                 cache_hits,
                 current_path: current_path.to_owned(),
+                hash_workers: self.hash_workers,
+                speed_bps: (hashed_bytes as f64 / self.started.elapsed().as_secs_f64().max(0.001))
+                    as u64,
             });
         }
     }
@@ -190,11 +203,13 @@ pub async fn create_snapshot(
     root: PathBuf,
     selected: Vec<String>,
     chunk_size: u32,
+    requested_hash_workers: u8,
     cache: HashMap<String, HashCacheEntry>,
     progress: UnboundedSender<SnapshotBuildProgress>,
 ) -> Result<(SnapshotRecord, Vec<(String, HashCacheEntry)>)> {
     tokio::task::spawn_blocking(move || {
         let chunk_size = chunk_size.clamp(1024 * 1024, 64 * 1024 * 1024) as usize;
+        let hash_workers = resolve_hash_workers(requested_hash_workers);
         let root = root.canonicalize()?;
         let snapshot_id = uuid::Uuid::new_v4().to_string();
         let mut paths = BTreeMap::<String, PathBuf>::new();
@@ -228,6 +243,8 @@ pub async fn create_snapshot(
                             total_bytes: 0,
                             cache_hits: 0,
                             current_path: child_relative,
+                            hash_workers: hash_workers as u32,
+                            speed_bps: 0,
                         });
                     }
                 }
@@ -258,19 +275,24 @@ pub async fn create_snapshot(
             total_bytes,
             cache_hits: 0,
             current_path: String::new(),
+            hash_workers: hash_workers as u32,
+            speed_bps: 0,
         });
 
         let reporter = Arc::new(HashProgress {
             snapshot_id: snapshot_id.clone(),
             sender: progress,
             prepared_bytes: AtomicU64::new(0),
+            hashed_bytes: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             total_entries,
             total_bytes,
+            hash_workers: hash_workers as u32,
+            started: Instant::now(),
             last_emit: Mutex::new(Instant::now()),
         });
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
+            .num_threads(hash_workers)
             .thread_name(|index| format!("lanflow-hash-{index}"))
             .build()
             .map_err(|error| LanFlowError::Internal(error.to_string()))?;
@@ -379,8 +401,9 @@ fn hash_file(
     chunk_size: usize,
     mut on_bytes: impl FnMut(u64),
 ) -> Result<(blake3::Hash, Vec<ChunkHash>)> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::with_capacity(chunk_size.min(8 * 1024 * 1024), file);
+    // The OS already caches file reads. An additional BufReader with another
+    // chunk-sized buffer only adds copying for this large sequential workload.
+    let mut reader = File::open(path)?;
     let mut full = blake3::Hasher::new();
     let mut chunks = Vec::new();
     let mut offset = 0u64;
@@ -399,8 +422,19 @@ fn hash_file(
             break;
         }
         let bytes = &buffer[..read];
-        full.update(bytes);
-        let hash = blake3::hash(bytes);
+        // Whole-file and logical-chunk BLAKE3 are independent. Run them in
+        // parallel, and let BLAKE3 split each large input across this snapshot's
+        // dedicated Rayon pool. This also accelerates a single huge file.
+        let ((), hash) = rayon::join(
+            || {
+                full.update_rayon(bytes);
+            },
+            || {
+                let mut chunk_hasher = blake3::Hasher::new();
+                chunk_hasher.update_rayon(bytes);
+                chunk_hasher.finalize()
+            },
+        );
         chunks.push(ChunkHash {
             index,
             offset,
@@ -415,6 +449,16 @@ fn hash_file(
         }
     }
     Ok((full.finalize(), chunks))
+}
+
+fn resolve_hash_workers(requested: u8) -> usize {
+    if requested > 0 {
+        return usize::from(requested.clamp(1, 32));
+    }
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .clamp(2, 16)
 }
 
 fn hash_cache_key(root: &Path, relative_path: &str) -> String {
@@ -489,6 +533,7 @@ pub fn safe_destination_path(root: &Path, relative: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn rejects_path_traversal() {
@@ -516,6 +561,7 @@ mod tests {
             root.clone(),
             vec!["folder".into()],
             1024 * 1024,
+            4,
             HashMap::new(),
             progress_sender,
         )
@@ -538,6 +584,7 @@ mod tests {
             root.clone(),
             vec!["folder".into()],
             1024 * 1024,
+            4,
             cache,
             progress_sender,
         )
@@ -548,5 +595,45 @@ mod tests {
         assert!(progress.iter().any(|event| event.cache_hits == 1));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Manual local probe: `cargo test -p lanflow-core --release
+    /// snapshot_hash_throughput_probe -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn snapshot_hash_throughput_probe() {
+        const MIB: usize = 1024 * 1024;
+        const TOTAL_MIB: usize = 256;
+        let path =
+            std::env::temp_dir().join(format!("lanflow-hash-probe-{}", uuid::Uuid::new_v4()));
+        let mut file = File::create(&path).unwrap();
+        let mut block = vec![0u8; 8 * MIB];
+        for (index, byte) in block.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(31).wrapping_add(17);
+        }
+        for _ in 0..(TOTAL_MIB / 8) {
+            file.write_all(&block).unwrap();
+        }
+        file.sync_all().unwrap();
+        drop(file);
+
+        let requested_workers = std::env::var("LANFLOW_HASH_PROBE_WORKERS")
+            .ok()
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(0);
+        let workers = resolve_hash_workers(requested_workers);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        let (_, chunks) = pool.install(|| hash_file(&path, 8 * MIB, |_| {})).unwrap();
+        let elapsed = started.elapsed().as_secs_f64();
+        eprintln!(
+            "LanFlow BLAKE3 probe: {TOTAL_MIB} MiB / {elapsed:.3}s = {:.1} MiB/s ({workers} workers)",
+            TOTAL_MIB as f64 / elapsed
+        );
+        assert_eq!(chunks.len(), TOTAL_MIB / 8);
+        std::fs::remove_file(path).unwrap();
     }
 }

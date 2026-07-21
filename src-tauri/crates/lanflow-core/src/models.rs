@@ -91,12 +91,14 @@ pub struct TaskDto {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(default, rename_all = "camelCase")]
 pub struct PerformanceSettings {
     pub automatic: bool,
     pub data_connections: u8,
     pub streams_per_connection: u8,
     pub chunk_size_mib: u32,
+    /// Zero selects an automatic value based on available parallelism.
+    pub hash_workers: u8,
     pub bandwidth_limit_mbps: u32,
     pub listen_port: u16,
     pub autostart: bool,
@@ -109,6 +111,7 @@ impl Default for PerformanceSettings {
             data_connections: 2,
             streams_per_connection: 4,
             chunk_size_mib: 8,
+            hash_workers: 0,
             bandwidth_limit_mbps: 0,
             listen_port: 47_932,
             autostart: false,

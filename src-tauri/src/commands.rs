@@ -28,6 +28,8 @@ struct SnapshotProgressEvent {
     total_bytes: u64,
     cache_hits: u64,
     current_path: String,
+    hash_workers: u32,
+    speed_bps: u64,
 }
 
 #[tauri::command]
@@ -295,7 +297,7 @@ pub async fn create_download_task(
                         status: "preparing".into(),
                         completed_bytes: progress.prepared_bytes,
                         total_bytes: progress.total_bytes,
-                        speed_bps: 0,
+                        speed_bps: progress.speed_bps,
                         completed_files: 0,
                         file_count: progress.total_entries,
                         current_file: progress.current_path.clone(),
@@ -312,6 +314,8 @@ pub async fn create_download_task(
                         total_bytes: progress.total_bytes,
                         cache_hits: progress.cache_hits,
                         current_path: progress.current_path,
+                        hash_workers: progress.hash_workers,
+                        speed_bps: progress.speed_bps,
                     },
                 );
             },
@@ -406,7 +410,7 @@ pub async fn resume_task(core: State<'_, Arc<AppCore>>, task_id: String) -> Resu
                         status: "preparing".into(),
                         completed_bytes: progress.prepared_bytes,
                         total_bytes: progress.total_bytes,
-                        speed_bps: 0,
+                        speed_bps: progress.speed_bps,
                         completed_files: 0,
                         file_count: progress.total_entries,
                         current_file: progress.current_path.clone(),
@@ -423,6 +427,8 @@ pub async fn resume_task(core: State<'_, Arc<AppCore>>, task_id: String) -> Resu
                         total_bytes: progress.total_bytes,
                         cache_hits: progress.cache_hits,
                         current_path: progress.current_path,
+                        hash_workers: progress.hash_workers,
+                        speed_bps: progress.speed_bps,
                     },
                 );
             },
@@ -457,6 +463,7 @@ pub async fn save_settings(
     if !(1..=8).contains(&settings.data_connections)
         || !(1..=16).contains(&settings.streams_per_connection)
         || !(1..=64).contains(&settings.chunk_size_mib)
+        || settings.hash_workers > 32
     {
         return Err(LanFlowError::InvalidInput("性能参数超出允许范围".into()));
     }

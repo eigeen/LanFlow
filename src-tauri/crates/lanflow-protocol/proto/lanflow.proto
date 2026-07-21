@@ -96,6 +96,8 @@ message SnapshotProgress {
   uint64 total_bytes = 6;
   uint64 cache_hits = 7;
   string current_path = 8;
+  uint32 hash_workers = 9;
+  uint64 speed_bps = 10;
 }
 
 message SnapshotManifestPage {

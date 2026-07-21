@@ -344,6 +344,7 @@ async fn handle_connection(context: Arc<ServerContext>, stream: TcpStream) -> Re
                     send_error(&sender, &frame.header, 3001, "分享不存在", false).await?;
                     continue;
                 };
+                let hash_workers = context.db.settings().await?.hash_workers;
                 let cache = context.db.load_hash_cache().await?;
                 let (progress_sender, mut progress_receiver) =
                     tokio::sync::mpsc::unbounded_channel();
@@ -355,6 +356,7 @@ async fn handle_connection(context: Arc<ServerContext>, stream: TcpStream) -> Re
                     } else {
                         request.chunk_size
                     },
+                    hash_workers,
                     cache,
                     progress_sender,
                 );
@@ -377,6 +379,8 @@ async fn handle_connection(context: Arc<ServerContext>, stream: TcpStream) -> Re
                                         total_bytes: progress.total_bytes,
                                         cache_hits: progress.cache_hits,
                                         current_path: progress.current_path,
+                                        hash_workers: progress.hash_workers,
+                                        speed_bps: progress.speed_bps,
                                     }),
                                 ).await?;
                             }
