@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use rand::Rng;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::net::TcpStream;
@@ -16,11 +16,30 @@ use lanflow_protocol::frame::{FLAG_MORE, Frame, FrameHeader, FrameType, read_fra
 use lanflow_protocol::protocol::wire::envelope::Payload;
 use lanflow_protocol::protocol::wire::{
     AuthFinish, AuthStart, ChunkRequest, CreateSnapshotRequest, Hello, ListEntriesRequest,
-    ListSharesRequest, SessionAttach, SnapshotManifest, SnapshotProgress,
+    ListSharesRequest, SessionAttach, SmallFileBatchRequest, SnapshotManifest, SnapshotProgress,
 };
 use lanflow_protocol::protocol::{
-    MAX_FRAME_SIZE, PROTOCOL_MAJOR, PROTOCOL_MINOR, decode_envelope, encode_envelope, envelope,
+    FEATURE_SMALL_FILE_BATCH, MAX_FRAME_SIZE, MAX_SMALL_FILE_BATCH_BYTES,
+    MAX_SMALL_FILE_BATCH_COUNT, MAX_SMALL_FILE_SIZE, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    SUPPORTED_FEATURES, decode_envelope, encode_envelope, envelope,
 };
+
+#[derive(Clone)]
+pub struct SmallFileSpec {
+    pub id: String,
+    pub size: u64,
+    pub blake3: Bytes,
+}
+
+pub struct BufferedSmallFile {
+    pub id: String,
+    pub data: Bytes,
+}
+
+pub struct DownloadedChunk {
+    pub bytes: u64,
+    pub data: Option<Bytes>,
+}
 
 pub struct MuxConnection {
     writer: Mutex<tokio::net::tcp::OwnedWriteHalf>,
@@ -41,7 +60,7 @@ impl MuxConnection {
             min_major: PROTOCOL_MAJOR as u32,
             max_major: PROTOCOL_MAJOR as u32,
             max_minor: PROTOCOL_MINOR as u32,
-            features: 0b1111,
+            features: SUPPORTED_FEATURES,
             max_frame_size: MAX_FRAME_SIZE as u32,
             max_concurrent_streams: 16,
         });
@@ -159,7 +178,8 @@ impl MuxConnection {
         file_id: &str,
         chunk: &lanflow_protocol::protocol::wire::ChunkHash,
         destination: &mut tokio::fs::File,
-    ) -> Result<u64> {
+        capture_data: bool,
+    ) -> Result<DownloadedChunk> {
         let (_, mut receiver) = self
             .start_request(Payload::ChunkRequest(ChunkRequest {
                 snapshot_id: snapshot_id.to_owned(),
@@ -168,6 +188,7 @@ impl MuxConnection {
             }))
             .await?;
         let mut hasher = blake3::Hasher::new();
+        let mut captured = capture_data.then(|| BytesMut::with_capacity(chunk.length as usize));
         let mut received = 0u64;
         while let Some(frame) = receiver.recv().await {
             match frame.header.frame_type {
@@ -177,6 +198,9 @@ impl MuxConnection {
                         .await?;
                     destination.write_all(&frame.body).await?;
                     hasher.update(&frame.body);
+                    if let Some(captured) = &mut captured {
+                        captured.extend_from_slice(&frame.body);
+                    }
                     received += frame.body.len() as u64;
                 }
                 FrameType::Error => {
@@ -198,7 +222,10 @@ impl MuxConnection {
                             {
                                 return Err(LanFlowError::Protocol("分片 BLAKE3 校验失败".into()));
                             }
-                            return Ok(received);
+                            return Ok(DownloadedChunk {
+                                bytes: received,
+                                data: captured.map(BytesMut::freeze),
+                            });
                         }
                         Some(Payload::Error(error)) => {
                             return Err(LanFlowError::Protocol(error.message));
@@ -209,6 +236,102 @@ impl MuxConnection {
             }
         }
         Err(LanFlowError::Protocol("分片传输意外结束".into()))
+    }
+
+    pub async fn download_small_file_batch(
+        &self,
+        snapshot_id: &str,
+        files: &[SmallFileSpec],
+    ) -> Result<Vec<BufferedSmallFile>> {
+        if files.is_empty()
+            || files.len() > MAX_SMALL_FILE_BATCH_COUNT
+            || files.iter().any(|file| file.size > MAX_SMALL_FILE_SIZE)
+            || files.iter().map(|file| file.size).sum::<u64>() > MAX_SMALL_FILE_BATCH_BYTES
+        {
+            return Err(LanFlowError::InvalidInput("小文件批次超出协议上限".into()));
+        }
+        let (_, mut receiver) = self
+            .start_request(Payload::SmallFileBatchRequest(SmallFileBatchRequest {
+                snapshot_id: snapshot_id.to_owned(),
+                file_ids: files.iter().map(|file| file.id.clone()).collect(),
+            }))
+            .await?;
+        let mut output = Vec::with_capacity(files.len());
+        let mut current = 0usize;
+        let mut current_data = BytesMut::with_capacity(files[0].size as usize);
+        let mut sequence = 0u32;
+        let mut total_received = 0u64;
+        while let Some(frame) = receiver.recv().await {
+            match frame.header.frame_type {
+                FrameType::Data => {
+                    let expected = files
+                        .get(current)
+                        .ok_or_else(|| LanFlowError::Protocol("批量响应包含多余文件数据".into()))?;
+                    if frame.header.file_offset != current_data.len() as u64
+                        || frame.header.sequence != sequence
+                        || current_data.len().saturating_add(frame.body.len())
+                            > expected.size as usize
+                    {
+                        return Err(LanFlowError::Protocol("批量文件数据偏移或序号无效".into()));
+                    }
+                    current_data.extend_from_slice(&frame.body);
+                    total_received += frame.body.len() as u64;
+                    sequence += 1;
+                }
+                FrameType::Error => {
+                    let message = decode_envelope(&frame.body)?;
+                    if let Some(Payload::Error(error)) = message.payload {
+                        return Err(LanFlowError::Protocol(error.message));
+                    }
+                }
+                _ => {
+                    let message = decode_envelope(&frame.body)?;
+                    match message.payload {
+                        Some(Payload::SmallFileComplete(complete)) => {
+                            let expected = files.get(current).ok_or_else(|| {
+                                LanFlowError::Protocol("批量响应包含多余文件".into())
+                            })?;
+                            let actual = blake3::hash(&current_data);
+                            if complete.file_id != expected.id
+                                || complete.bytes_sent != expected.size
+                                || complete.blake3 != expected.blake3
+                                || current_data.len() as u64 != expected.size
+                                || actual.as_bytes() != expected.blake3.as_ref()
+                            {
+                                return Err(LanFlowError::Protocol(
+                                    "批量小文件 BLAKE3 校验失败".into(),
+                                ));
+                            }
+                            output.push(BufferedSmallFile {
+                                id: expected.id.clone(),
+                                data: std::mem::take(&mut current_data).freeze(),
+                            });
+                            current += 1;
+                            sequence = 0;
+                            if let Some(next) = files.get(current) {
+                                current_data = BytesMut::with_capacity(next.size as usize);
+                            }
+                        }
+                        Some(Payload::SmallFileBatchComplete(complete)) => {
+                            if current != files.len()
+                                || complete.files_sent as usize != files.len()
+                                || complete.bytes_sent != total_received
+                            {
+                                return Err(LanFlowError::Protocol(
+                                    "批量小文件完成标记无效".into(),
+                                ));
+                            }
+                            return Ok(output);
+                        }
+                        Some(Payload::Error(error)) => {
+                            return Err(LanFlowError::Protocol(error.message));
+                        }
+                        _ => return Err(LanFlowError::Protocol("批量小文件响应无效".into())),
+                    }
+                }
+            }
+        }
+        Err(LanFlowError::Protocol("批量小文件传输意外结束".into()))
     }
 }
 
@@ -435,5 +558,10 @@ impl PeerClient {
             .attach_session(&session.session_id, &session.key)
             .await?;
         Ok(connection)
+    }
+
+    pub fn supports_small_file_batch(&self) -> bool {
+        self.control.remote_hello.max_minor >= 2
+            && self.control.remote_hello.features & FEATURE_SMALL_FILE_BATCH != 0
     }
 }

@@ -464,6 +464,7 @@ pub async fn save_settings(
         || !(1..=16).contains(&settings.streams_per_connection)
         || !(1..=64).contains(&settings.chunk_size_mib)
         || settings.hash_workers > 32
+        || settings.memory_buffer_mib > 2048
     {
         return Err(LanFlowError::InvalidInput("性能参数超出允许范围".into()));
     }

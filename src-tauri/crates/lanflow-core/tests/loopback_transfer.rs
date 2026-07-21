@@ -101,13 +101,17 @@ async fn real_tree_loopback_throughput() {
         .unwrap();
     let engine = TaskEngine::new(client_db.clone(), Arc::new(|_| {}));
     let transfer_started = Instant::now();
+    let mut settings = PerformanceSettings::default();
+    if std::env::var_os("LANFLOW_E2E_DISABLE_MEMORY_BUFFER").is_some() {
+        settings.memory_buffer_mib = 0;
+    }
     engine
         .start(
             task.clone(),
             client,
             manifest,
             ConflictPolicy::Overwrite,
-            PerformanceSettings::default(),
+            settings,
         )
         .await
         .unwrap();

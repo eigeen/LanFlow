@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,13 +12,14 @@ use serde::Serialize;
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::client::{MuxConnection, PeerClient};
+use crate::client::{MuxConnection, PeerClient, SmallFileSpec};
 use crate::db::Database;
 use crate::discovery::now_ms;
 use crate::error::{LanFlowError, Result};
 use crate::fileops::safe_destination_path;
 use crate::models::{ConflictPolicy, PerformanceSettings, TaskDto};
 use lanflow_protocol::protocol::wire::{ManifestFile, SnapshotManifest};
+use lanflow_protocol::protocol::{MAX_SMALL_FILE_BATCH_COUNT, MAX_SMALL_FILE_SIZE};
 
 #[derive(Clone)]
 struct TaskControl {
@@ -29,6 +30,20 @@ struct DownloadedFile {
     id: String,
     relative_path: String,
 }
+
+enum DownloadWork {
+    File { file: ManifestFile, bitmap: Vec<u8> },
+    SmallBatch(Vec<ManifestFile>),
+}
+
+struct PreparedSmallFile {
+    file: ManifestFile,
+    final_target: PathBuf,
+    partial: PathBuf,
+}
+
+const MEMORY_BUFFERED_FILE_SIZE: u64 = 4 * 1024;
+const MEMORY_BUFFER_BATCH_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -193,7 +208,17 @@ impl TaskEngine {
         // Keep network slots busy while other files are being created, verified, or
         // renamed. This is especially important for game projects with many tiny files.
         let file_limit = stream_limit.saturating_mul(2).clamp(4, 64);
+        let memory_buffer_bytes = u64::from(settings.memory_buffer_mib) * 1024 * 1024;
+        let small_file_buffer_budget = memory_buffer_bytes / 2;
+        let ordered_hash_buffer_budget = memory_buffer_bytes - small_file_buffer_budget;
+        let batch_target_bytes = if small_file_buffer_budget == 0 {
+            0
+        } else {
+            (small_file_buffer_budget / file_limit as u64)
+                .clamp(MEMORY_BUFFERED_FILE_SIZE, MEMORY_BUFFER_BATCH_BYTES)
+        };
         let connection_cursor = Arc::new(AtomicUsize::new(0));
+        let file_io_semaphore = Arc::new(Semaphore::new(file_limit));
 
         let destination_root = PathBuf::from(&task.destination);
         tokio::fs::create_dir_all(&destination_root).await?;
@@ -211,41 +236,71 @@ impl TaskEngine {
             }
         }
         let bitmaps = self.db.task_chunk_bitmaps(&task.id).await?;
+        let work = build_download_work(
+            files,
+            &bitmaps,
+            client.supports_small_file_batch() && batch_target_bytes > 0,
+            batch_target_bytes,
+        );
         let snapshot_id = manifest.snapshot_id;
         let task_id = task.id.clone();
         let db = self.db.clone();
-        let downloads = stream::iter(files.into_iter().map(|file| {
+        let transfer_cancel = cancel.child_token();
+        let downloads = stream::iter(work.into_iter().map(|work| {
             let client = client.clone();
             let connections = connections.clone();
             let semaphore = semaphore.clone();
             let connection_cursor = connection_cursor.clone();
+            let file_io_semaphore = file_io_semaphore.clone();
             let destination_root = destination_root.clone();
             let partial_root = partial_root.clone();
             let snapshot_id = snapshot_id.clone();
             let task_id = task_id.clone();
             let db = db.clone();
-            let cancel = cancel.clone();
+            let cancel = transfer_cancel.clone();
             let completed_bytes = completed_bytes.clone();
-            let bitmap = bitmaps.get(&file.id).cloned().unwrap_or_default();
             let policy = policy.clone();
             async move {
-                download_file(
-                    file,
-                    bitmap,
-                    &destination_root,
-                    &partial_root,
-                    policy,
-                    &snapshot_id,
-                    &task_id,
-                    client,
-                    connections,
-                    semaphore,
-                    connection_cursor,
-                    completed_bytes,
-                    cancel,
-                    db,
-                )
-                .await
+                match work {
+                    DownloadWork::File { file, bitmap } => download_file(
+                        file,
+                        bitmap,
+                        &destination_root,
+                        &partial_root,
+                        policy,
+                        &snapshot_id,
+                        &task_id,
+                        client,
+                        connections,
+                        semaphore,
+                        stream_limit,
+                        ordered_hash_buffer_budget,
+                        file_io_semaphore,
+                        connection_cursor,
+                        completed_bytes,
+                        cancel,
+                        db,
+                    )
+                    .await
+                    .map(|file| vec![file]),
+                    DownloadWork::SmallBatch(files) => {
+                        download_small_file_batch(
+                            files,
+                            &destination_root,
+                            &partial_root,
+                            policy,
+                            &snapshot_id,
+                            client,
+                            connections,
+                            semaphore,
+                            file_io_semaphore,
+                            connection_cursor,
+                            completed_bytes,
+                            cancel,
+                        )
+                        .await
+                    }
+                }
             }
         }))
         .buffer_unordered(file_limit);
@@ -276,10 +331,18 @@ impl TaskEngine {
                 }
                 result = downloads.next() => {
                     let Some(result) = result else { break; };
-                    let downloaded = result?;
-                    current_file = downloaded.relative_path;
-                    completed_files += 1;
-                    pending_complete.push(downloaded.id);
+                    let downloaded = match result {
+                        Ok(downloaded) => downloaded,
+                        Err(error) => {
+                            transfer_cancel.cancel();
+                            return Err(error);
+                        }
+                    };
+                    for file in downloaded {
+                        current_file = file.relative_path;
+                        completed_files += 1;
+                        pending_complete.push(file.id);
+                    }
                     if pending_complete.len() >= 256 {
                         self.db.mark_files_complete(&task.id, std::mem::take(&mut pending_complete)).await?;
                     }
@@ -354,6 +417,203 @@ impl TaskEngine {
     }
 }
 
+fn build_download_work(
+    files: Vec<ManifestFile>,
+    bitmaps: &HashMap<String, Vec<u8>>,
+    supports_batch: bool,
+    batch_target_bytes: u64,
+) -> Vec<DownloadWork> {
+    let mut work = Vec::new();
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0u64;
+    for file in files {
+        let bitmap = bitmaps.get(&file.id).cloned().unwrap_or_default();
+        if supports_batch
+            && small_file_batch_eligible(&file)
+            && !bitmap.iter().any(|byte| *byte != 0)
+        {
+            if batch.len() >= MAX_SMALL_FILE_BATCH_COUNT
+                || batch_bytes.saturating_add(file.size) > batch_target_bytes
+            {
+                work.push(DownloadWork::SmallBatch(std::mem::take(&mut batch)));
+                batch_bytes = 0;
+            }
+            batch_bytes += file.size;
+            batch.push(file);
+        } else {
+            work.push(DownloadWork::File { file, bitmap });
+        }
+    }
+    if !batch.is_empty() {
+        work.push(DownloadWork::SmallBatch(batch));
+    }
+    work
+}
+
+fn small_file_batch_eligible(file: &ManifestFile) -> bool {
+    if file.is_dir || file.size > MEMORY_BUFFERED_FILE_SIZE || file.size > MAX_SMALL_FILE_SIZE {
+        return false;
+    }
+    if file.size == 0 {
+        return file.chunks.is_empty();
+    }
+    file.chunks.len() == 1
+        && file.chunks[0].offset == 0
+        && file.chunks[0].length as u64 == file.size
+        && file.chunks[0].blake3 == file.blake3
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_small_file_batch(
+    files: Vec<ManifestFile>,
+    destination_root: &Path,
+    partial_root: &Path,
+    policy: ConflictPolicy,
+    snapshot_id: &str,
+    client: Arc<PeerClient>,
+    connections: Vec<Arc<MuxConnection>>,
+    semaphore: Arc<Semaphore>,
+    file_io_semaphore: Arc<Semaphore>,
+    connection_cursor: Arc<AtomicUsize>,
+    completed_bytes: Arc<AtomicU64>,
+    cancel: CancellationToken,
+) -> Result<Vec<DownloadedFile>> {
+    let mut completed = Vec::new();
+    let mut prepared = Vec::with_capacity(files.len());
+    for file in files {
+        if cancel.is_cancelled() {
+            return Err(LanFlowError::Cancelled);
+        }
+        let target = safe_destination_path(destination_root, &file.relative_path)?;
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        if tokio::fs::try_exists(&target).await?
+            && file_hash_matches(target.clone(), file.blake3.clone()).await?
+        {
+            completed_bytes.fetch_add(file.size, Ordering::Relaxed);
+            completed.push(DownloadedFile {
+                id: file.id,
+                relative_path: file.relative_path,
+            });
+            continue;
+        }
+        if tokio::fs::try_exists(&target).await? && policy == ConflictPolicy::Skip {
+            completed_bytes.fetch_add(file.size, Ordering::Relaxed);
+            completed.push(DownloadedFile {
+                id: file.id,
+                relative_path: file.relative_path,
+            });
+            continue;
+        }
+        let final_target =
+            if tokio::fs::try_exists(&target).await? && policy == ConflictPolicy::KeepBoth {
+                keep_both_path(&target)
+            } else {
+                target
+            };
+        prepared.push(PreparedSmallFile {
+            partial: partial_root.join(format!("{}.part", file.id)),
+            file,
+            final_target,
+        });
+    }
+    if prepared.is_empty() {
+        return Ok(completed);
+    }
+
+    let specs = prepared
+        .iter()
+        .map(|item| SmallFileSpec {
+            id: item.file.id.clone(),
+            size: item.file.size,
+            blake3: item.file.blake3.clone(),
+        })
+        .collect::<Vec<_>>();
+    let permit = tokio::select! {
+        _ = cancel.cancelled() => return Err(LanFlowError::Cancelled),
+        permit = semaphore.acquire_owned() => permit.map_err(|_| LanFlowError::Cancelled)?,
+    };
+    let connection_index = connection_cursor.fetch_add(1, Ordering::Relaxed);
+    let mut connection = connections[connection_index % connections.len()].clone();
+    let mut last_error = None;
+    let mut buffered = None;
+    for attempt in 0..3u32 {
+        let result = tokio::select! {
+            _ = cancel.cancelled() => return Err(LanFlowError::Cancelled),
+            result = connection.download_small_file_batch(snapshot_id, &specs) => result,
+        };
+        match result {
+            Ok(files) => {
+                buffered = Some(files);
+                break;
+            }
+            Err(LanFlowError::Cancelled) => return Err(LanFlowError::Cancelled),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < 2 {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(LanFlowError::Cancelled),
+                        _ = tokio::time::sleep(Duration::from_millis(250 * 2u64.pow(attempt))) => {}
+                    }
+                    connection = client.data_connection().await?;
+                }
+            }
+        }
+    }
+    let buffered = buffered.ok_or_else(|| {
+        last_error.unwrap_or_else(|| LanFlowError::Protocol("批量小文件重试失败".into()))
+    })?;
+    drop(permit);
+    if buffered.len() != prepared.len() {
+        return Err(LanFlowError::Protocol("批量小文件数量不匹配".into()));
+    }
+
+    let writes = stream::iter(prepared.into_iter().zip(buffered).map(|(item, buffered)| {
+        let file_io_semaphore = file_io_semaphore.clone();
+        let cancel = cancel.clone();
+        let policy = policy.clone();
+        async move {
+            let _file_io_permit = tokio::select! {
+                _ = cancel.cancelled() => return Err(LanFlowError::Cancelled),
+                permit = file_io_semaphore.acquire_owned() => permit.map_err(|_| LanFlowError::Cancelled)?,
+            };
+            if item.file.id != buffered.id || buffered.data.len() as u64 != item.file.size {
+                return Err(LanFlowError::Protocol("批量小文件顺序不匹配".into()));
+            }
+            tokio::fs::write(&item.partial, &buffered.data).await?;
+            if tokio::fs::try_exists(&item.final_target).await?
+                && policy == ConflictPolicy::Overwrite
+            {
+                tokio::fs::remove_file(&item.final_target).await?;
+            }
+            tokio::fs::rename(&item.partial, &item.final_target).await?;
+            let modified = filetime::FileTime::from_unix_time(
+                item.file.modified_ms.div_euclid(1000),
+                (item.file.modified_ms.rem_euclid(1000) * 1_000_000) as u32,
+            );
+            let _ = filetime::set_file_mtime(&item.final_target, modified);
+            Ok::<_, LanFlowError>((
+                DownloadedFile {
+                    id: item.file.id,
+                    relative_path: item.file.relative_path,
+                },
+                buffered.data.len() as u64,
+            ))
+        }
+    }))
+    // Keep metadata I/O bounded. Too many parallel creates/renames can make
+    // APFS and NTFS slower than a modest queue, especially with antivirus.
+    .buffer_unordered(MAX_SMALL_FILE_BATCH_COUNT);
+    tokio::pin!(writes);
+    while let Some(result) = writes.next().await {
+        let (file, bytes) = result?;
+        completed_bytes.fetch_add(bytes, Ordering::Relaxed);
+        completed.push(file);
+    }
+    Ok(completed)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn download_file(
     file: ManifestFile,
@@ -366,6 +626,9 @@ async fn download_file(
     client: Arc<PeerClient>,
     connections: Vec<Arc<MuxConnection>>,
     semaphore: Arc<Semaphore>,
+    stream_limit: usize,
+    ordered_hash_buffer_bytes: u64,
+    file_io_semaphore: Arc<Semaphore>,
     connection_cursor: Arc<AtomicUsize>,
     completed_bytes: Arc<AtomicU64>,
     cancel: CancellationToken,
@@ -374,6 +637,10 @@ async fn download_file(
     if cancel.is_cancelled() {
         return Err(LanFlowError::Cancelled);
     }
+    let _file_io_permit = tokio::select! {
+        _ = cancel.cancelled() => return Err(LanFlowError::Cancelled),
+        permit = file_io_semaphore.acquire_owned() => permit.map_err(|_| LanFlowError::Cancelled)?,
+    };
     let target = safe_destination_path(destination_root, &file.relative_path)?;
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -421,6 +688,18 @@ async fn download_file(
     drop(base_file);
 
     let mut missing_chunks = 0usize;
+    let max_chunk_length = file
+        .chunks
+        .iter()
+        .map(|chunk| chunk.length as u64)
+        .max()
+        .unwrap_or(0);
+    let capture_full_hash = file.chunks.len() > 1
+        && !bitmap.iter().any(|byte| *byte != 0)
+        && max_chunk_length.saturating_mul(stream_limit as u64) <= ordered_hash_buffer_bytes;
+    let mut ordered_hasher = capture_full_hash.then(blake3::Hasher::new);
+    let mut buffered_chunks = BTreeMap::new();
+    let mut next_hash_index = 0usize;
     let mut transfers = FuturesUnordered::new();
     for chunk in &file.chunks {
         if bit_is_set(&bitmap, chunk.index as usize) {
@@ -428,13 +707,17 @@ async fn download_file(
             continue;
         }
         missing_chunks += 1;
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| LanFlowError::Cancelled)?;
         let connection_index = connection_cursor.fetch_add(1, Ordering::Relaxed);
         let initial_connection = connections[connection_index % connections.len()].clone();
+        let preacquired_permit = if capture_full_hash {
+            None
+        } else {
+            Some(tokio::select! {
+                _ = cancel.cancelled() => return Err(LanFlowError::Cancelled),
+                permit = semaphore.clone().acquire_owned() => permit.map_err(|_| LanFlowError::Cancelled)?,
+            })
+        };
+        let semaphore = semaphore.clone();
         let client = client.clone();
         let snapshot_id = snapshot_id.to_owned();
         let file_id = file.id.clone();
@@ -442,7 +725,13 @@ async fn download_file(
         let partial = partial.clone();
         let cancel = cancel.clone();
         transfers.push(tokio::spawn(async move {
-            let _permit = permit;
+            let permit = match preacquired_permit {
+                Some(permit) => permit,
+                None => tokio::select! {
+                    _ = cancel.cancelled() => return Err(LanFlowError::Cancelled),
+                    permit = semaphore.acquire_owned() => permit.map_err(|_| LanFlowError::Cancelled)?,
+                },
+            };
             let mut last_error = None;
             let mut connection = initial_connection;
             for attempt in 0..3u32 {
@@ -453,10 +742,19 @@ async fn download_file(
                     .await?;
                 let result = tokio::select! {
                     _ = cancel.cancelled() => return Err(LanFlowError::Cancelled),
-                    result = connection.download_chunk(&snapshot_id, &file_id, &chunk, &mut handle) => result,
+                    result = connection.download_chunk(
+                        &snapshot_id,
+                        &file_id,
+                        &chunk,
+                        &mut handle,
+                        capture_full_hash,
+                    ) => result,
                 };
                 match result {
-                    Ok(bytes) => return Ok((bytes, chunk.index as usize)),
+                    Ok(download) => {
+                        let held_permit = capture_full_hash.then_some(permit);
+                        return Ok((download, chunk.index as usize, held_permit));
+                    }
                     Err(LanFlowError::Cancelled) => return Err(LanFlowError::Cancelled),
                     Err(error) => {
                         last_error = Some(error);
@@ -476,8 +774,17 @@ async fn download_file(
     let mut first_error = None;
     while let Some(joined) = transfers.next().await {
         match joined.map_err(|error| LanFlowError::Internal(error.to_string()))? {
-            Ok((bytes, index)) => {
-                completed_bytes.fetch_add(bytes, Ordering::Relaxed);
+            Ok((download, index, _held_permit)) => {
+                completed_bytes.fetch_add(download.bytes, Ordering::Relaxed);
+                if let Some(data) = download.data {
+                    buffered_chunks.insert(index, data);
+                    while let Some(data) = buffered_chunks.remove(&next_hash_index) {
+                        if let Some(hasher) = &mut ordered_hasher {
+                            hasher.update(&data);
+                        }
+                        next_hash_index += 1;
+                    }
+                }
                 completed_indexes.push(index);
             }
             Err(error) if first_error.is_none() => first_error = Some(error),
@@ -503,12 +810,19 @@ async fn download_file(
         return Err(error);
     }
 
+    let verified_during_transfer = ordered_hasher
+        .filter(|_| next_hash_index == file.chunks.len() && buffered_chunks.is_empty())
+        .map(|hasher| hasher.finalize().as_bytes() == file.blake3.as_ref())
+        .unwrap_or(false);
+
     let verified_by_single_chunk = file.chunks.len() == 1
         && missing_chunks == 1
         && file.chunks[0].offset == 0
         && file.chunks[0].length as u64 == file.size
         && file.chunks[0].blake3 == file.blake3;
-    if !verified_by_single_chunk && !file_hash_matches(partial.clone(), file.blake3.clone()).await?
+    if !verified_by_single_chunk
+        && !verified_during_transfer
+        && !file_hash_matches(partial.clone(), file.blake3.clone()).await?
     {
         return Err(LanFlowError::Protocol(format!(
             "{} 整文件校验失败",
@@ -624,6 +938,69 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use lanflow_protocol::protocol::wire::ChunkHash;
+
+    fn manifest_file(index: usize, size: usize) -> ManifestFile {
+        let data = vec![index as u8; size];
+        let hash = Bytes::copy_from_slice(blake3::hash(&data).as_bytes());
+        ManifestFile {
+            id: format!("file-{index}"),
+            relative_path: format!("folder/file-{index}"),
+            size: size as u64,
+            modified_ms: 1,
+            blake3: hash.clone(),
+            chunks: if size == 0 {
+                Vec::new()
+            } else {
+                vec![ChunkHash {
+                    index: 0,
+                    offset: 0,
+                    length: size as u32,
+                    blake3: hash,
+                }]
+            },
+            is_dir: false,
+        }
+    }
+
+    #[test]
+    fn small_file_work_is_bounded_and_has_legacy_fallback() {
+        let mut files = (0..300)
+            .map(|index| manifest_file(index, 4 * 1024))
+            .collect::<Vec<_>>();
+        files.push(manifest_file(999, 65 * 1024));
+        let work = build_download_work(
+            files.clone(),
+            &HashMap::new(),
+            true,
+            MEMORY_BUFFER_BATCH_BYTES,
+        );
+        let mut batched = 0usize;
+        let mut individual = 0usize;
+        for item in work {
+            match item {
+                DownloadWork::SmallBatch(files) => {
+                    assert!(files.len() <= MAX_SMALL_FILE_BATCH_COUNT);
+                    assert!(
+                        files.iter().map(|file| file.size).sum::<u64>()
+                            <= MEMORY_BUFFER_BATCH_BYTES
+                    );
+                    batched += files.len();
+                }
+                DownloadWork::File { .. } => individual += 1,
+            }
+        }
+        assert_eq!(batched, 300);
+        assert_eq!(individual, 1);
+
+        let fallback =
+            build_download_work(files, &HashMap::new(), false, MEMORY_BUFFER_BATCH_BYTES);
+        assert_eq!(fallback.len(), 301);
+        assert!(
+            fallback
+                .iter()
+                .all(|item| matches!(item, DownloadWork::File { .. }))
+        );
+    }
 
     #[tokio::test]
     async fn resume_validation_clears_only_corrupt_chunks() {

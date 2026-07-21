@@ -99,6 +99,8 @@ pub struct PerformanceSettings {
     pub chunk_size_mib: u32,
     /// Zero selects an automatic value based on available parallelism.
     pub hash_workers: u8,
+    /// Shared upper budget for in-memory transfer optimizations. Zero disables them.
+    pub memory_buffer_mib: u32,
     pub bandwidth_limit_mbps: u32,
     pub listen_port: u16,
     pub autostart: bool,
@@ -112,6 +114,7 @@ impl Default for PerformanceSettings {
             streams_per_connection: 4,
             chunk_size_mib: 8,
             hash_workers: 0,
+            memory_buffer_mib: 128,
             bandwidth_limit_mbps: 0,
             listen_port: 47_932,
             autostart: false,

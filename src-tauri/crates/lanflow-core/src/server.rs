@@ -19,11 +19,13 @@ use lanflow_protocol::frame::{FLAG_MORE, Frame, FrameHeader, FrameType, read_fra
 use lanflow_protocol::protocol::wire::envelope::Payload;
 use lanflow_protocol::protocol::wire::{
     AuthChallenge, AuthResult, ChunkComplete, Error as WireError, Hello, ListEntriesResponse,
-    ListSharesResponse, Pong, ShareInfo, SnapshotManifestPage, SnapshotProgress,
+    ListSharesResponse, Pong, ShareInfo, SmallFileBatchComplete, SmallFileComplete,
+    SnapshotManifestPage, SnapshotProgress,
 };
 use lanflow_protocol::protocol::{
-    DEFAULT_CHUNK_SIZE, DEFAULT_DATA_FRAME_SIZE, MAX_FRAME_SIZE, PROTOCOL_MAJOR, PROTOCOL_MINOR,
-    decode_envelope, encode_envelope, envelope,
+    DEFAULT_CHUNK_SIZE, DEFAULT_DATA_FRAME_SIZE, MAX_FRAME_SIZE, MAX_SMALL_FILE_BATCH_BYTES,
+    MAX_SMALL_FILE_BATCH_COUNT, MAX_SMALL_FILE_SIZE, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    SUPPORTED_FEATURES, decode_envelope, encode_envelope, envelope,
 };
 
 struct Session {
@@ -136,7 +138,7 @@ async fn handle_connection(context: Arc<ServerContext>, stream: TcpStream) -> Re
             min_major: PROTOCOL_MAJOR as u32,
             max_major: PROTOCOL_MAJOR as u32,
             max_minor: PROTOCOL_MINOR as u32,
-            features: 0b1111,
+            features: SUPPORTED_FEATURES,
             max_frame_size: MAX_FRAME_SIZE as u32,
             max_concurrent_streams: 16,
         }),
@@ -407,6 +409,37 @@ async fn handle_connection(context: Arc<ServerContext>, stream: TcpStream) -> Re
                     .await?;
                 }
             }
+            Payload::SmallFileBatchRequest(request) => {
+                let _session = active_session
+                    .as_ref()
+                    .ok_or_else(|| LanFlowError::Auth("请先认证".into()))?;
+                let snapshot = context
+                    .snapshots
+                    .read()
+                    .await
+                    .get(&request.snapshot_id)
+                    .cloned();
+                let Some(snapshot) = snapshot else {
+                    send_error(&sender, &frame.header, 4001, "快照不存在或已过期", true).await?;
+                    continue;
+                };
+                let files = match prepare_small_file_batch(&snapshot, &request.file_ids) {
+                    Ok(files) => files,
+                    Err(error) => {
+                        send_error(&sender, &frame.header, 4005, &error.to_string(), false).await?;
+                        continue;
+                    }
+                };
+                let sender = sender.clone();
+                let header = frame.header;
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        serve_small_file_batch(sender.clone(), header.clone(), files).await
+                    {
+                        let _ = send_error(&sender, &header, 4006, &error.to_string(), true).await;
+                    }
+                });
+            }
             Payload::ChunkRequest(request) => {
                 let _session = active_session
                     .as_ref()
@@ -472,6 +505,116 @@ async fn handle_connection(context: Arc<ServerContext>, stream: TcpStream) -> Re
         .await
         .map_err(|error| LanFlowError::Internal(error.to_string()))??;
     Ok(())
+}
+
+fn prepare_small_file_batch(
+    snapshot: &SnapshotRecord,
+    file_ids: &[String],
+) -> Result<Vec<crate::fileops::SnapshotFile>> {
+    if file_ids.is_empty() || file_ids.len() > MAX_SMALL_FILE_BATCH_COUNT {
+        return Err(LanFlowError::InvalidInput("小文件批次数量超出上限".into()));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(file_ids.len());
+    let mut files = Vec::with_capacity(file_ids.len());
+    let mut total_bytes = 0u64;
+    for file_id in file_ids {
+        if !seen.insert(file_id) {
+            return Err(LanFlowError::InvalidInput("小文件批次包含重复文件".into()));
+        }
+        let file = snapshot
+            .find_file(file_id)
+            .cloned()
+            .ok_or_else(|| LanFlowError::NotFound("快照文件不存在".into()))?;
+        let manifest = &file.manifest;
+        let valid_chunks = if manifest.size == 0 {
+            manifest.chunks.is_empty()
+        } else {
+            manifest.chunks.len() == 1
+                && manifest.chunks[0].offset == 0
+                && manifest.chunks[0].length as u64 == manifest.size
+                && manifest.chunks[0].blake3 == manifest.blake3
+        };
+        if manifest.is_dir || manifest.size > MAX_SMALL_FILE_SIZE || !valid_chunks {
+            return Err(LanFlowError::InvalidInput(
+                "批次包含非小文件或不兼容分片".into(),
+            ));
+        }
+        total_bytes = total_bytes.saturating_add(manifest.size);
+        if total_bytes > MAX_SMALL_FILE_BATCH_BYTES {
+            return Err(LanFlowError::InvalidInput(
+                "小文件批次字节数超出上限".into(),
+            ));
+        }
+        files.push(file);
+    }
+    Ok(files)
+}
+
+async fn serve_small_file_batch(
+    sender: mpsc::Sender<Frame>,
+    request_header: FrameHeader,
+    files: Vec<crate::fileops::SnapshotFile>,
+) -> Result<()> {
+    let mut total_bytes = 0u64;
+    for snapshot_file in &files {
+        let manifest = &snapshot_file.manifest;
+        let metadata = tokio::fs::metadata(&snapshot_file.absolute_path).await?;
+        if metadata.len() != manifest.size {
+            return Err(LanFlowError::Protocol(format!(
+                "源文件在传输期间发生变化: {}",
+                manifest.relative_path
+            )));
+        }
+        let mut file = tokio::fs::File::open(&snapshot_file.absolute_path).await?;
+        let mut remaining = manifest.size as usize;
+        let mut offset = 0u64;
+        let mut sequence = 0u32;
+        while remaining > 0 {
+            let size = remaining.min(DEFAULT_DATA_FRAME_SIZE);
+            let mut buffer = vec![0u8; size];
+            file.read_exact(&mut buffer).await?;
+            let mut header = FrameHeader::new(
+                FrameType::Data,
+                request_header.stream_id,
+                request_header.request_id,
+            );
+            header.file_offset = offset;
+            header.sequence = sequence;
+            sender
+                .send(Frame {
+                    header,
+                    body: Bytes::from(buffer),
+                })
+                .await
+                .map_err(|_| LanFlowError::Cancelled)?;
+            remaining -= size;
+            offset += size as u64;
+            sequence += 1;
+        }
+        total_bytes += manifest.size;
+        send_envelope_with_flags(
+            &sender,
+            request_header.clone(),
+            FrameType::Control,
+            FLAG_MORE,
+            Payload::SmallFileComplete(SmallFileComplete {
+                file_id: manifest.id.clone(),
+                blake3: manifest.blake3.clone(),
+                bytes_sent: manifest.size,
+            }),
+        )
+        .await?;
+    }
+    send_envelope(
+        &sender,
+        request_header,
+        FrameType::Control,
+        Payload::SmallFileBatchComplete(SmallFileBatchComplete {
+            files_sent: files.len() as u32,
+            bytes_sent: total_bytes,
+        }),
+    )
+    .await
 }
 
 fn require_session(active: &Option<Arc<Session>>, share_id: &str) -> Result<Arc<Session>> {
@@ -642,6 +785,32 @@ mod tests {
     use super::*;
     use crate::fileops::SnapshotFile;
     use lanflow_protocol::protocol::wire::ManifestFile;
+
+    #[test]
+    fn small_file_batch_validation_rejects_duplicates() {
+        let data = b"small payload";
+        let hash = Bytes::copy_from_slice(blake3::hash(data).as_bytes());
+        let file = SnapshotFile {
+            absolute_path: "/tmp/small".into(),
+            manifest: ManifestFile {
+                id: "small".into(),
+                relative_path: "small".into(),
+                size: data.len() as u64,
+                modified_ms: 1,
+                blake3: hash.clone(),
+                chunks: vec![lanflow_protocol::protocol::wire::ChunkHash {
+                    index: 0,
+                    offset: 0,
+                    length: data.len() as u32,
+                    blake3: hash,
+                }],
+                is_dir: false,
+            },
+        };
+        let snapshot = SnapshotRecord::new("snapshot".into(), vec![file]);
+        assert!(prepare_small_file_batch(&snapshot, &["small".into()]).is_ok());
+        assert!(prepare_small_file_batch(&snapshot, &["small".into(), "small".into()]).is_err());
+    }
 
     #[tokio::test]
     async fn large_manifest_is_split_into_bounded_pages() {
