@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 
 use crate::auth::{begin_client_login, mac, verify_mac};
 use crate::error::{LanFlowError, Result};
+use crate::fileops::rebase_snapshot_manifest;
 use crate::models::{PeerDto, RemoteEntryDto, RemoteShareDto};
 use lanflow_protocol::frame::{FLAG_MORE, Frame, FrameHeader, FrameType, read_frame, write_frame};
 use lanflow_protocol::protocol::wire::envelope::Payload;
@@ -484,6 +485,7 @@ impl PeerClient {
         chunk_size: u32,
         on_progress: impl Fn(SnapshotProgress),
     ) -> Result<SnapshotManifest> {
+        let selected_paths = paths.clone();
         let (request_id, mut receiver) = self
             .control
             .start_request(Payload::CreateSnapshotRequest(CreateSnapshotRequest {
@@ -526,15 +528,18 @@ impl PeerClient {
                     files.extend(page.files);
                     if page.done {
                         self.control.pending.lock().await.remove(&request_id);
-                        return Ok(SnapshotManifest {
-                            snapshot_id,
-                            files,
-                            error: String::new(),
-                        });
+                        return rebase_snapshot_manifest(
+                            SnapshotManifest {
+                                snapshot_id,
+                                files,
+                                error: String::new(),
+                            },
+                            &selected_paths,
+                        );
                     }
                 }
                 Some(Payload::SnapshotManifest(manifest)) if manifest.error.is_empty() => {
-                    return Ok(manifest);
+                    return rebase_snapshot_manifest(manifest, &selected_paths);
                 }
                 Some(Payload::SnapshotManifest(manifest)) => {
                     return Err(LanFlowError::Protocol(manifest.error));

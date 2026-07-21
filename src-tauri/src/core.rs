@@ -52,10 +52,12 @@ impl AppCore {
                 id
             }
         };
-        let device_name = db
+        let stored_device_name = db
             .get_meta("device_name")
             .await?
-            .and_then(|value| String::from_utf8(value).ok())
+            .and_then(|value| String::from_utf8(value).ok());
+        let device_name = stored_device_name
+            .filter(|name| !should_refresh_device_name(name))
             .unwrap_or_else(default_device_name);
         db.set_meta("device_name", device_name.as_bytes()).await?;
 
@@ -156,7 +158,83 @@ impl Drop for AppCore {
 }
 
 fn default_device_name() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "LanFlow 设备".into())
+    resolve_device_name(
+        whoami::devicename().ok(),
+        std::env::var("COMPUTERNAME").ok(),
+        std::env::var("HOSTNAME").ok(),
+        whoami::hostname().ok(),
+    )
+}
+
+fn resolve_device_name(
+    pretty_name: Option<String>,
+    computer_name: Option<String>,
+    host_env: Option<String>,
+    hostname: Option<String>,
+) -> String {
+    [pretty_name, computer_name, host_env, hostname]
+        .into_iter()
+        .flatten()
+        .find_map(normalize_device_name)
+        .unwrap_or_else(|| "LanFlow 设备".into())
+}
+
+fn normalize_device_name(value: String) -> Option<String> {
+    let value = value.trim().trim_end_matches(".local").trim();
+    if value.is_empty()
+        || value.eq_ignore_ascii_case("localhost")
+        || value.eq_ignore_ascii_case("localhost.localdomain")
+    {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+fn should_refresh_device_name(value: &str) -> bool {
+    let value = value.trim();
+    value.is_empty()
+        || value == "LanFlow 设备"
+        || value.eq_ignore_ascii_case("lanflow device")
+        || value.eq_ignore_ascii_case("localhost")
+        || value.eq_ignore_ascii_case("localhost.localdomain")
+        || value.to_ascii_lowercase().ends_with(".local")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_name_prefers_pretty_system_name() {
+        assert_eq!(
+            resolve_device_name(
+                Some("Eigeen 的 MacBook Pro".into()),
+                None,
+                Some("fallback-host".into()),
+                None,
+            ),
+            "Eigeen 的 MacBook Pro"
+        );
+    }
+
+    #[test]
+    fn device_name_cleans_local_suffix_and_rejects_localhost() {
+        assert_eq!(
+            resolve_device_name(
+                Some("localhost".into()),
+                None,
+                Some("mac-studio.local".into()),
+                None,
+            ),
+            "mac-studio"
+        );
+    }
+
+    #[test]
+    fn placeholder_device_name_is_refreshed() {
+        assert!(should_refresh_device_name("LanFlow 设备"));
+        assert!(should_refresh_device_name("EigeendeMacBook-Air.local"));
+        assert!(!should_refresh_device_name("工作室 Mac"));
+    }
 }

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -136,6 +137,80 @@ pub fn validate_relative_path(relative: &str) -> Result<PathBuf> {
         }
     }
     Ok(clean)
+}
+
+/// Convert share-root-relative paths returned by the server into paths relative
+/// to this download task. The common parent of the selected items is removed,
+/// so selecting `unity/taiwu` and saving into `.../unity` creates
+/// `.../unity/taiwu`, not `.../unity/unity/taiwu`.
+pub fn rebase_snapshot_manifest(
+    mut manifest: SnapshotManifest,
+    selected: &[String],
+) -> Result<SnapshotManifest> {
+    if selected.is_empty() {
+        return Err(LanFlowError::InvalidInput("快照没有选择项".into()));
+    }
+    let selected = selected
+        .iter()
+        .map(|path| validate_relative_path(path))
+        .collect::<Result<Vec<_>>>()?;
+    let base = common_selection_parent(&selected);
+
+    for file in &mut manifest.files {
+        let original = validate_relative_path(&file.relative_path)?;
+        let belongs_to_selection = selected.iter().any(|selection| {
+            selection.as_os_str().is_empty()
+                || original == *selection
+                || original.starts_with(selection)
+        });
+        if !belongs_to_selection {
+            return Err(LanFlowError::Protocol(format!(
+                "快照路径不属于所选范围: {}",
+                file.relative_path
+            )));
+        }
+        let rebased = original
+            .strip_prefix(&base)
+            .map_err(|_| LanFlowError::Protocol("快照路径无法映射到目标目录".into()))?;
+        file.relative_path = protocol_relative_path(rebased);
+    }
+    Ok(manifest)
+}
+
+fn common_selection_parent(selected: &[PathBuf]) -> PathBuf {
+    let mut common: Option<Vec<OsString>> = None;
+    for path in selected {
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        let components = parent
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(value) => Some(value.to_os_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        match &mut common {
+            None => common = Some(components),
+            Some(common) => {
+                let shared = common
+                    .iter()
+                    .zip(&components)
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                common.truncate(shared);
+            }
+        }
+    }
+    common.unwrap_or_default().into_iter().collect::<PathBuf>()
+}
+
+fn protocol_relative_path(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 pub fn resolve_shared_path(root: &Path, relative: &str) -> Result<PathBuf> {
@@ -556,6 +631,94 @@ mod tests {
         assert!(safe_destination_component("CON").starts_with("~lf-"));
         assert!(safe_destination_component("bad:name").starts_with("~lf-"));
         assert_eq!(safe_destination_component("normal.txt"), "normal.txt");
+    }
+
+    #[test]
+    fn snapshot_paths_are_relative_to_single_selection_parent() {
+        let manifest = test_manifest(&[
+            "unity/taiwu",
+            "unity/taiwu/assets",
+            "unity/taiwu/assets/data.bin",
+        ]);
+        let rebased = rebase_snapshot_manifest(manifest, &["unity/taiwu".into()]).unwrap();
+        assert_eq!(
+            manifest_paths(&rebased),
+            ["taiwu", "taiwu/assets", "taiwu/assets/data.bin"]
+        );
+        assert_eq!(rebased.files[2].id, "file-2");
+        assert_eq!(
+            safe_destination_path(
+                Path::new("/Users/test/project/unity"),
+                &rebased.files[2].relative_path,
+            )
+            .unwrap(),
+            Path::new("/Users/test/project/unity/taiwu/assets/data.bin")
+        );
+    }
+
+    #[test]
+    fn snapshot_paths_use_common_parent_for_multiple_selections() {
+        let manifest = test_manifest(&["unity/taiwu/file.txt", "unity/witch/file.txt"]);
+        let rebased =
+            rebase_snapshot_manifest(manifest, &["unity/taiwu".into(), "unity/witch".into()])
+                .unwrap();
+        assert_eq!(
+            manifest_paths(&rebased),
+            ["taiwu/file.txt", "witch/file.txt"]
+        );
+    }
+
+    #[test]
+    fn snapshot_paths_keep_ancestors_needed_to_avoid_cross_branch_collisions() {
+        let manifest = test_manifest(&["a/files/data.bin", "b/files/data.bin"]);
+        let rebased =
+            rebase_snapshot_manifest(manifest, &["a/files".into(), "b/files".into()]).unwrap();
+        assert_eq!(
+            manifest_paths(&rebased),
+            ["a/files/data.bin", "b/files/data.bin"]
+        );
+    }
+
+    #[test]
+    fn snapshot_root_selection_keeps_share_relative_paths() {
+        let rebased =
+            rebase_snapshot_manifest(test_manifest(&["", "folder/file.txt"]), &[".".into()])
+                .unwrap();
+        assert_eq!(manifest_paths(&rebased), ["", "folder/file.txt"]);
+    }
+
+    #[test]
+    fn snapshot_rebase_rejects_files_outside_selection() {
+        let error = rebase_snapshot_manifest(
+            test_manifest(&["other/private.txt"]),
+            &["unity/taiwu".into()],
+        )
+        .unwrap_err();
+        assert!(matches!(error, LanFlowError::Protocol(_)));
+    }
+
+    fn test_manifest(paths: &[&str]) -> SnapshotManifest {
+        SnapshotManifest {
+            snapshot_id: "snapshot".into(),
+            files: paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| ManifestFile {
+                    id: format!("file-{index}"),
+                    relative_path: (*path).into(),
+                    ..Default::default()
+                })
+                .collect(),
+            error: String::new(),
+        }
+    }
+
+    fn manifest_paths(manifest: &SnapshotManifest) -> Vec<&str> {
+        manifest
+            .files
+            .iter()
+            .map(|file| file.relative_path.as_str())
+            .collect()
     }
 
     #[tokio::test]
